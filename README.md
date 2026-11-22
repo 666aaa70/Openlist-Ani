@@ -15,6 +15,100 @@
 
 ---
 
+## 🔧 本 Fork 改动说明（基于 TwooSix/Openlist-Ani）
+
+本仓库在原版基础上新增以下改动（不改变原有 API，完全向后兼容）：
+
+### 1. 支持空 RSS 启动（仅通过 API 手动提交磁力任务）
+
+- 允许 `[rss]` 中 `urls = []`（或省略 `[rss]`）直接启动，不再因缺少 RSS 链接报错退出。
+- 仍保留对无效 RSS 配置的校验（如空白 URL、`interval_time <= 0`、无效正则/优先级字段等）。
+- `rss.urls` 为空时跳过订阅轮询抓取，手动下载 API（`POST /api/downloads` 等）、PikPak 离线下载、番剧识别与重命名功能保持正常；后续也可通过 `POST /api/rss` 动态添加订阅恢复抓取。
+
+### 2. 下载整理后自动复制到 OpenList 其他文件夹并删除源文件
+
+- 在 `[downloader.openlist]` 新增以下可选配置（对所有 OpenList 离线下载工具生效，包括 PikPak）：
+  - `copy_target_paths`：目标文件夹路径列表（默认 `[]`，为空时不启用复制；支持配置一个或多个路径，禁止与 `downloader.download_path` 相同）。
+  - `delete_source_after_copy`：所有目标复制校验完成后是否删除原下载目录中的源文件（默认 `true`，节省 PikPak 等中转网盘空间；如需保留源文件可设为 `false`）。
+- 工作流程：番剧识别、重命名并整理到 `<download_path>/<番剧名>/Season <季>/` 后，按相同的 `<番剧名>/Season <季>/` 子目录结构将视频和关联字幕复制到所有目标文件夹。
+- 安全与容错：兼容 OpenList 跨存储异步复制（轮询 `/api/task/copy/*` 等待完成）和同存储同步复制，支持中断后断点恢复；**只有全部目标目录均复制成功并校验文件存在且大小一致后**，才会删除源文件并更新任务 `final_path`，任何目标失败均会重试且绝不提前删除源文件。
+
+### 3. 自动构建 AMD64/ARM64 GHCR 镜像（支持 1Panel V2 部署）
+
+- 新增 [`.github/workflows/docker-ghcr.yml`](.github/workflows/docker-ghcr.yml)：推送 `master`、`v*` 标签或手动触发时，自动原生构建 `linux/amd64` 与 `linux/arm64` 并发布至 GHCR。
+- **镜像地址**：
+  - `ghcr.io/666aaa70/openlist-ani:latest`（跟踪 `master` 最新版）
+  - `ghcr.io/666aaa70/openlist-ani:master` / `ghcr.io/666aaa70/openlist-ani:sha-<commit>`
+
+#### 快速配置示例（空 RSS + PikPak 离线下载 + 自动复制到目标目录）
+
+```toml
+config_version = 2
+
+[backend]
+host = "0.0.0.0" # 供宿主机或同网络其他容器调用 API
+port = 26666
+
+[rss]
+urls = []
+
+[downloader]
+download_path = "/PikPak/Anime"
+rename_format = "{anime_name} S{season:02d}E{episode:02d} {fansub} {quality} {languages}"
+
+[downloader.openlist]
+url = "http://openlist:5244"
+token = "你的OpenList令牌"
+offline_download_tool = "PikPak"
+copy_target_paths = ["/115/Anime"] # 支持多个目标路径，如 ["/115/Anime", "/Local/Anime"]
+delete_source_after_copy = true    # 复制校验完成后自动删除 PikPak 原文件
+
+[metadata]
+pipeline = ["regex", "tmdb"]
+```
+
+#### 1Panel V2 Docker Compose 示例
+
+> 容器以 UID/GID `1000:1000` 运行，首次部署前请先创建文件并授权：
+> ```bash
+> mkdir -p /opt/1panel/apps/openlist-ani/{data,logs,skills}
+> touch /opt/1panel/apps/openlist-ani/config.toml
+> chown -R 1000:1000 /opt/1panel/apps/openlist-ani
+> ```
+
+```yaml
+services:
+  openlist-ani:
+    image: ghcr.io/666aaa70/openlist-ani:latest
+    container_name: openlist-ani
+    restart: unless-stopped
+    ports:
+      - "26666:26666"
+    environment:
+      - TZ=Asia/Shanghai
+      - CONFIG_PATH=/config.toml
+      - ENABLE_ASSISTANT=false
+    volumes:
+      - /opt/1panel/apps/openlist-ani/config.toml:/config.toml
+      - /opt/1panel/apps/openlist-ani/data:/data
+      - /opt/1panel/apps/openlist-ani/logs:/logs
+      - /opt/1panel/apps/openlist-ani/skills:/skills
+    networks:
+      - 1panel-network
+
+networks:
+  1panel-network:
+    external: true
+```
+
+更新镜像：
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+---
+
 ## ✨ 特点
 
 - 📡 **自动追番** — 自动获取 RSS 番剧更新并下载
