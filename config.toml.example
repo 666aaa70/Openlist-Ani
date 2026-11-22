@@ -35,6 +35,8 @@ rename_format = "{anime_name} S{season:02d}E{episode:02d} {fansub} {quality} {la
 url = "http://localhost:5244"
 token = ""
 offline_download_tool = "qBittorrent"  # Supported: aria2, qBittorrent, PikPak, 115 Cloud, 115 Open, 123Pan, 123 Open, SimpleHttp, Thunder, ThunderBrowser, ThunderX, Transmission
+copy_target_paths = []  # Optional: copy organized files to other OpenList folder(s), e.g. ["/115/Anime"]
+delete_source_after_copy = true  # Delete source files in download_path after all copy targets finish (only applies when copy_target_paths is non-empty)
 
 [metadata]
 # Default when AI is not enabled. The recommended pipeline is ["ai", "tmdb"];

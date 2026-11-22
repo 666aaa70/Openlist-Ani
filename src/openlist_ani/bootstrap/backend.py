@@ -156,6 +156,14 @@ def _log_startup_summary(config, core_settings: CoreSettings) -> None:
     logger.info(f"Metadata      : {providers}")
     logger.info(f"Downloader    : {core_settings.download_backend}")
     logger.info(f"OpenList URL  : {config.downloader.openlist.url}")
+    if config.downloader.openlist.copy_target_paths:
+        targets = ", ".join(config.downloader.openlist.copy_target_paths)
+        mode = (
+            "copy+delete"
+            if config.downloader.openlist.delete_source_after_copy
+            else "copy"
+        )
+        logger.info(f"Copy targets  : {targets} ({mode})")
     logger.info(f"Notifications : {notification_status}")
     logger.info(f"Backend API   : {config.backend.host}:{config.backend.port}")
     logger.info("=" * 56)
@@ -428,7 +436,11 @@ def _create_openlist_backend_bundle(
             client=client,
             offline_download_tool=config.downloader.openlist.offline_download_tool,
         ),
-        organizer=OpenListOrganizerAdapter(client),
+        organizer=OpenListOrganizerAdapter(
+            client,
+            copy_target_paths=config.downloader.openlist.copy_target_paths,
+            delete_source_after_copy=config.downloader.openlist.delete_source_after_copy,
+        ),
         health_check=health.validate,
         close=close if callable(close) else None,
     )

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
+from typing import Any
 
 from openlist_ani.application.organization import DurableOrganizationExecutor
 from openlist_ani.application.ports import (
@@ -13,11 +14,13 @@ from openlist_ani.application.ports import (
     DownloadedFile,
     OrganizedAsset,
     OrganizationRequest,
+    OrganizationResult,
     OrganizationSidecar,
 )
 from openlist_ani.domain import DownloadJob
 
 from .client import OpenListClient
+from .post_copy import OpenListPostCopyExecutor
 from .storage import OpenListStorageOperations
 
 
@@ -28,10 +31,20 @@ class OpenListOrganizerAdapter:
         self,
         client: OpenListClient,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        *,
+        copy_target_paths: Iterable[str] = (),
+        delete_source_after_copy: bool = True,
     ) -> None:
         self._client = client
         self._storage = OpenListStorageOperations(client, sleep)
         self._executor = DurableOrganizationExecutor(self._storage)
+        self._post_copy = OpenListPostCopyExecutor(
+            client,
+            self._storage,
+            copy_target_paths=copy_target_paths,
+            delete_source_after_copy=delete_source_after_copy,
+            sleep=sleep,
+        )
 
     async def organize(
         self,
@@ -74,7 +87,7 @@ class OpenListOrganizerAdapter:
                 target_filename=requests,
                 metadata=job.metadata,
             )
-            results = await self._executor.organize(
+            results = await self._organize_with_post_copy(
                 job,
                 converted_manifest,
                 (converted_request,),
@@ -92,9 +105,47 @@ class OpenListOrganizerAdapter:
 
         if isinstance(requests, str):
             raise TypeError("organization requests must be a tuple")
-        return await self._executor.organize(
+        return await self._organize_with_post_copy(
             job,
             manifest,
             requests,
             checkpoint_callback,
+        )
+
+    async def _organize_with_post_copy(
+        self,
+        job: DownloadJob,
+        manifest: DownloadManifest,
+        requests: tuple[OrganizationRequest, ...],
+        checkpoint_callback: CheckpointCallback | None,
+    ) -> tuple[OrganizationResult, ...]:
+        latest_checkpoint: dict[str, Any] = dict(
+            job.artifact.get("organization_checkpoint") or {}
+        )
+
+        async def track_checkpoint(payload: dict[str, Any]) -> None:
+            latest_checkpoint.clear()
+            latest_checkpoint.update(payload)
+            if checkpoint_callback is not None:
+                await checkpoint_callback(dict(latest_checkpoint))
+
+        results = await self._executor.organize(
+            job,
+            manifest,
+            requests,
+            track_checkpoint,
+        )
+        if not self._post_copy.enabled:
+            return results
+
+        async def save_post_copy(post_copy_state: dict[str, Any]) -> None:
+            latest_checkpoint["post_copy"] = post_copy_state
+            if checkpoint_callback is not None:
+                await checkpoint_callback(dict(latest_checkpoint))
+
+        return await self._post_copy.execute(
+            job,
+            results,
+            saved_state=latest_checkpoint.get("post_copy"),
+            save_state=save_post_copy,
         )

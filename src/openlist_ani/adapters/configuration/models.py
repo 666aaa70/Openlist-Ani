@@ -211,6 +211,8 @@ class OpenListConfig(ConfigModel):
     # values live on [downloader].
     download_path: str = Field(default="/", exclude=True)
     offline_download_tool: str = "qBittorrent"
+    copy_target_paths: list[str] = Field(default_factory=list)
+    delete_source_after_copy: bool = True
     rename_format: str = Field(
         default="{anime_name} S{season:02d}E{episode:02d} {fansub} {quality} {languages}",
         exclude=True,

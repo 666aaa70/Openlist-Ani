@@ -298,6 +298,74 @@ class OpenListClient:
             logger.warning(f"Failed to move files: {msg}")
             return False
 
+    async def copy_file(
+        self,
+        src_dir: str,
+        dst_dir: str,
+        filenames: list[str],
+        *,
+        overwrite: bool = False,
+    ) -> tuple[bool, list[OpenlistTask]]:
+        """Copy files from source directory to destination directory.
+
+        Returns ``(ok, tasks)`` where ``tasks`` contains any asynchronous copy
+        tasks created by OpenList (empty for synchronous same-storage copies).
+        """
+        if not self.token:
+            return False, []
+
+        url = f"{self.base_url}/api/fs/copy"
+        payload: dict[str, Any] = {
+            "src_dir": src_dir,
+            "dst_dir": dst_dir,
+            "names": filenames,
+        }
+        if overwrite:
+            payload["overwrite"] = True
+
+        data = await self._post(url, payload)
+        if data and data.get("code") == 200:
+            inner = data.get("data")
+            raw_tasks = (inner.get("tasks") or []) if isinstance(inner, dict) else []
+            tasks = [
+                OpenlistTask.from_dict(task)
+                for task in raw_tasks
+                if isinstance(task, dict)
+            ]
+            logger.debug(
+                f"Copied {filenames} from {src_dir} to {dst_dir} "
+                f"(async_tasks={len(tasks)})"
+            )
+            return True, tasks
+        else:
+            msg = data.get("message") if data else self.UNKNOWN_ERROR_MESSAGE
+            logger.warning(f"Failed to copy files: {msg}")
+            return False, []
+
+    async def get_copy_tasks_undone(self) -> list[OpenlistTask] | None:
+        """Get in-progress OpenList copy tasks."""
+        url = f"{self.base_url}/api/task/copy/undone"
+        data = await self._get(url)
+        if data and data.get("code") == 200:
+            tasks = data.get("data") or []
+            return [OpenlistTask.from_dict(t) for t in tasks]
+        else:
+            msg = data.get("message") if data else self.UNKNOWN_ERROR_MESSAGE
+            logger.warning(f"Failed to fetch undone copy tasks: {msg}")
+            return None
+
+    async def get_copy_tasks_done(self) -> list[OpenlistTask] | None:
+        """Get completed OpenList copy tasks."""
+        url = f"{self.base_url}/api/task/copy/done"
+        data = await self._get(url)
+        if data and data.get("code") == 200:
+            tasks = data.get("data") or []
+            return [OpenlistTask.from_dict(t) for t in tasks]
+        else:
+            msg = data.get("message") if data else self.UNKNOWN_ERROR_MESSAGE
+            logger.warning(f"Failed to fetch done copy tasks: {msg}")
+            return None
+
     async def remove_path(self, dir_path: str, names: list[str]) -> bool:
         """Remove files or directories."""
         if not self.token:

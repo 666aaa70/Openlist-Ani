@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import posixpath
+
 from openlist_ani.logger import FATAL_LEVEL, logger
 from openlist_ani.application.settings import CoreSettings
 
@@ -80,6 +82,41 @@ class ConfigValidator:
                 "OpenList token is not configured in [downloader.openlist] token. "
                 "Authentication will fail without a valid token."
             )
+
+        self._validate_copy_target_paths(openlist.copy_target_paths, errors)
+
+    def _validate_copy_target_paths(
+        self, target_paths: list[str], errors: list[str]
+    ) -> None:
+        if not target_paths:
+            return
+        download_path = posixpath.normpath(
+            (self._data.downloader.download_path or "/").strip().replace("\\", "/")
+            or "/"
+        )
+        for raw_path in target_paths:
+            stripped = raw_path.strip()
+            if not stripped:
+                errors.append("OpenList copy_target_paths cannot contain empty values.")
+                continue
+            normalized_raw = stripped.replace("\\", "/")
+            if not normalized_raw.startswith("/"):
+                errors.append(
+                    "OpenList copy_target_paths entries must be absolute paths "
+                    f"starting with '/': '{raw_path}'."
+                )
+                continue
+            if any(part in {".", ".."} for part in normalized_raw.split("/") if part):
+                errors.append(
+                    "OpenList copy_target_paths cannot contain '.' or '..' "
+                    f"segments: '{raw_path}'."
+                )
+                continue
+            if posixpath.normpath(normalized_raw) == download_path:
+                errors.append(
+                    "OpenList copy_target_paths cannot equal downloader.download_path "
+                    f"('{download_path}')."
+                )
 
     def _validate_metadata_dependencies(self, errors: list[str]) -> None:
         from openlist_ani.assistant.harness.adapters import agent_adapter_names

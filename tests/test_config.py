@@ -154,6 +154,46 @@ def test_empty_rss_urls_config_is_ready_to_run(payload):
                 "openlist": {"url": "http://localhost:5244", "token": "token"}
             },
         },
+        {
+            "downloader": {
+                "download_path": "/PikPak/Anime",
+                "openlist": {
+                    "url": "http://localhost:5244",
+                    "token": "token",
+                    "copy_target_paths": [""],
+                },
+            }
+        },
+        {
+            "downloader": {
+                "download_path": "/PikPak/Anime",
+                "openlist": {
+                    "url": "http://localhost:5244",
+                    "token": "token",
+                    "copy_target_paths": ["115/Anime"],
+                },
+            }
+        },
+        {
+            "downloader": {
+                "download_path": "/PikPak/Anime",
+                "openlist": {
+                    "url": "http://localhost:5244",
+                    "token": "token",
+                    "copy_target_paths": ["/115/../Anime"],
+                },
+            }
+        },
+        {
+            "downloader": {
+                "download_path": "/PikPak/Anime",
+                "openlist": {
+                    "url": "http://localhost:5244",
+                    "token": "token",
+                    "copy_target_paths": ["/PikPak/Anime/"],
+                },
+            }
+        },
     ],
     ids=[
         "empty-config-missing-token",
@@ -162,10 +202,37 @@ def test_empty_rss_urls_config_is_ready_to_run(payload):
         "missing-url",
         "blank-rss-url",
         "mixed-blank-rss-url",
+        "blank-copy-target-path",
+        "relative-copy-target-path",
+        "traversal-copy-target-path",
+        "copy-target-equals-download-path",
     ],
 )
 def test_missing_required_runtime_settings_are_rejected(payload):
     assert ConfigValidator(UserConfig.model_validate(payload)).validate() is False
+
+
+def test_openlist_copy_target_paths_config_is_validated():
+    config = UserConfig.model_validate(
+        {
+            "downloader": {
+                "download_path": "/PikPak/Anime",
+                "openlist": {
+                    "url": "http://localhost:5244",
+                    "token": "token",
+                    "offline_download_tool": "PikPak",
+                    "copy_target_paths": ["/115/Anime", "/Local/Anime"],
+                },
+            }
+        }
+    )
+
+    assert config.downloader.openlist.copy_target_paths == [
+        "/115/Anime",
+        "/Local/Anime",
+    ]
+    assert config.downloader.openlist.delete_source_after_copy is True
+    assert ConfigValidator(config).validate() is True
 
 
 @pytest.mark.parametrize(
@@ -194,6 +261,7 @@ def test_enabled_optional_features_require_a_usable_configuration(overrides):
     "build",
     [
         lambda: OpenListConfig(offline_download_tool=""),
+        lambda: OpenListConfig.model_validate({"copy_target_paths": "/115/Anime"}),
         lambda: DownloaderConfig(rename_format="{unsupported}"),
         lambda: MetadataFilterConfig(exclude_patterns=["[invalid"]),
         lambda: NotificationConfig(batch_interval=-1),
@@ -207,6 +275,7 @@ def test_enabled_optional_features_require_a_usable_configuration(overrides):
     ],
     ids=[
         "empty-tool",
+        "non-list-copy-target-paths",
         "bad-rename-field",
         "bad-filter-regex",
         "negative-batch",

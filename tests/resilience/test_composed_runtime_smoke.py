@@ -83,10 +83,16 @@ class _FakePikPakOpenListClient:
     def __init__(self, downloaded_filename: str) -> None:
         self._downloaded_filename = downloaded_filename
         self.offline_calls: list[dict[str, object]] = []
+        self.copy_calls: list[dict[str, object]] = []
+        self._copy_tasks_undone: list[OpenlistTask] = []
+        self._copy_tasks_done: list[OpenlistTask] = []
+        self._copy_payloads: dict[str, tuple[str, str, str]] = {}
         self._dirs: dict[str, dict[str, SimpleNamespace]] = {
             "/": {},
             "/PikPak": {},
             "/PikPak/Anime": {},
+            "/115": {},
+            "/115/Anime": {},
         }
 
     def _ensure_dir(self, path: str) -> dict[str, SimpleNamespace]:
@@ -181,6 +187,62 @@ class _FakePikPakOpenListClient:
             dst[name] = src.pop(name)
         return True
 
+    async def copy_file(
+        self,
+        src_dir: str,
+        dst_dir: str,
+        filenames: list[str],
+        *,
+        overwrite: bool = False,
+    ) -> tuple[bool, list[OpenlistTask]]:
+        norm_src = posixpath.normpath(src_dir)
+        norm_dst = posixpath.normpath(dst_dir)
+        self.copy_calls.append(
+            {
+                "src_dir": norm_src,
+                "dst_dir": norm_dst,
+                "filenames": list(filenames),
+                "overwrite": overwrite,
+            }
+        )
+        tasks: list[OpenlistTask] = []
+        for index, name in enumerate(filenames, start=1):
+            tid = f"copy-task-{len(self.copy_calls)}-{index}"
+            task = OpenlistTask(
+                id=tid,
+                name=f"copy [{norm_src}/{name}] to [{norm_dst}]",
+                state=OpenlistTaskState.RUNNING,
+                progress=50,
+            )
+            self._copy_tasks_undone.append(task)
+            self._copy_payloads[tid] = (norm_src, norm_dst, name)
+            tasks.append(task)
+        return True, tasks
+
+    async def get_copy_tasks_undone(self) -> list[OpenlistTask]:
+        if not self._copy_tasks_undone:
+            return []
+        running = list(self._copy_tasks_undone)
+        self._copy_tasks_undone.clear()
+        for task in running:
+            norm_src, norm_dst, name = self._copy_payloads[task.id]
+            entry = self._dirs[norm_src][name]
+            self._ensure_dir(norm_dst)[name] = SimpleNamespace(
+                name=name, is_dir=False, size=entry.size
+            )
+            self._copy_tasks_done.append(
+                OpenlistTask(
+                    id=task.id,
+                    name=task.name,
+                    state=OpenlistTaskState.SUCCEEDED,
+                    progress=100,
+                )
+            )
+        return []
+
+    async def get_copy_tasks_done(self) -> list[OpenlistTask]:
+        return list(self._copy_tasks_done)
+
     async def remove_path(self, directory: str, filenames: list[str]) -> bool:
         parent = self._dirs.get(posixpath.normpath(directory), {})
         for name in filenames:
@@ -235,6 +297,8 @@ pipeline = ["regex"]
         bundle.downloader._sleep = AsyncMock()
         bundle.organizer._storage._sleep = AsyncMock()
         bundle.organizer._storage._cache_refresh_seconds = 0
+        bundle.organizer._post_copy._sleep = AsyncMock()
+        bundle.organizer._post_copy._poll_interval_seconds = 0
         return bundle
 
     monkeypatch.setattr(
@@ -305,5 +369,111 @@ pipeline = ["regex"]
                 in fake_client._dirs["/PikPak/Anime/Frieren/Season 1"]
             )
             feed_fetch_spy.assert_not_awaited()
+    finally:
+        await assembly.runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_pikpak_download_auto_copies_to_target_and_deletes_source_end_to_end(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+config_version = 2
+
+[rss]
+urls = []
+
+[downloader]
+download_path = "/PikPak/Anime"
+rename_format = "{anime_name} S{season:02d}E{episode:02d} {fansub} {quality} {languages}"
+
+[downloader.openlist]
+url = "http://127.0.0.1:5244"
+token = "test-token"
+offline_download_tool = "PikPak"
+copy_target_paths = ["/115/Anime"]
+delete_source_after_copy = true
+
+[metadata]
+pipeline = ["regex"]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CONFIG_PATH", str(config_path))
+    monkeypatch.setattr(config_loader, "_config_instance", None)
+    monkeypatch.setattr(BackendApiService, "_instance", None)
+
+    raw_filename = "[Lilith-Raws] Frieren - 01 [1080p][CHT].mkv"
+    fake_client = _FakePikPakOpenListClient(raw_filename)
+    original_bundle_factory = backend_module._create_openlist_backend_bundle
+
+    def _patched_bundle(cfg, *, client=None):
+        bundle = original_bundle_factory(cfg, client=client or fake_client)
+        bundle.downloader._sleep = AsyncMock()
+        bundle.organizer._storage._sleep = AsyncMock()
+        bundle.organizer._storage._cache_refresh_seconds = 0
+        bundle.organizer._post_copy._sleep = AsyncMock()
+        bundle.organizer._post_copy._poll_interval_seconds = 0
+        return bundle
+
+    monkeypatch.setattr(
+        backend_module, "_create_openlist_backend_bundle", _patched_bundle
+    )
+
+    config, settings = _load_runtime_config()
+    LegacyMigrationRunner().run()
+    assembly = await _compose_runtime(config, settings)
+
+    await backend_module._check_download_backend_health(assembly)
+    await assembly.runtime.start()
+    BackendApiService.init(assembly.application)
+    app = create_app()
+
+    magnet_url = "magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98"
+    release_title = "[Lilith-Raws] Frieren - 01 [1080p][CHT]"
+    expected_name = "Frieren S01E01 Lilith-Raws 1080p 繁.mkv"
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as http_client:
+            create_resp = await http_client.post(
+                "/api/downloads",
+                json={"download_url": magnet_url, "title": release_title},
+            )
+            assert create_resp.status_code == 200
+            task_id = create_resp.json()["task"]["id"]
+
+            final_task = None
+            for _ in range(100):
+                detail_resp = await http_client.get(f"/api/downloads/{task_id}")
+                assert detail_resp.status_code == 200
+                detail = detail_resp.json()
+                if detail["state"] in {"completed", "failed", "cancelled"}:
+                    final_task = detail
+                    break
+                await asyncio.sleep(0.05)
+
+            assert final_task is not None
+            assert final_task["state"] == "completed", final_task
+            assert (
+                final_task["final_path"]
+                == f"/115/Anime/Frieren/Season 1/{expected_name}"
+            )
+            assert len(fake_client.copy_calls) == 1
+            assert fake_client.copy_calls[0] == {
+                "src_dir": "/PikPak/Anime/Frieren/Season 1",
+                "dst_dir": "/115/Anime/Frieren/Season 1",
+                "filenames": [expected_name],
+                "overwrite": False,
+            }
+            assert expected_name in fake_client._dirs["/115/Anime/Frieren/Season 1"]
+            assert (
+                expected_name not in fake_client._dirs["/PikPak/Anime/Frieren/Season 1"]
+            )
     finally:
         await assembly.runtime.stop()
