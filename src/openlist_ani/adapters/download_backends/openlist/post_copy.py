@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import posixpath
+import re
+import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import replace
 from typing import Any
@@ -25,6 +27,13 @@ _TERMINAL_FAILURE_STATES = frozenset(
         OpenlistTaskState.FAILED,
     }
 )
+_SUPPORTED_COPY_MODES = frozenset({"copy", "aria2"})
+_COPY_TEMP_ROOT_DIR = ".oani-copy-tmp"
+_ARIA2_TOOL_NAME = "aria2"
+_ARIA2_MIN_SPLIT_SIZE = "1M"
+_DEFAULT_COPY_THREADS = 8
+_MAX_COPY_THREADS = 16
+_SAFE_TOKEN_RE = re.compile(r"[^A-Za-z0-9_-]+")
 
 
 def normalize_openlist_path(path: str) -> str:
@@ -67,11 +76,48 @@ def _relative_subdir(base_path: str, src_dir: str) -> str:
     return norm_src[len(prefix) :].strip("/")
 
 
+def _make_staging_token(job_id: str, target_index: int, file_index: int) -> str:
+    safe_job = _SAFE_TOKEN_RE.sub("-", str(job_id or "job")).strip("-")[:16] or "job"
+    return f"{safe_job}-t{target_index}-f{file_index}-{uuid.uuid4().hex[:8]}"
+
+
+def _resolve_raw_url(file_info: dict[str, Any] | None, base_url: str) -> str:
+    if not isinstance(file_info, dict):
+        return ""
+    raw_url = str(file_info.get("raw_url") or "").strip()
+    if not raw_url:
+        return ""
+    if raw_url.startswith("/") and base_url:
+        return f"{base_url.rstrip('/')}{raw_url}"
+    return raw_url
+
+
+def _select_staged_file(
+    entries: tuple[StorageEntry, ...],
+    expected_name: str,
+    expected_size: int,
+) -> StorageEntry | None:
+    files = [entry for entry in entries if not entry.is_directory]
+    if not files:
+        return None
+    if len(files) == 1:
+        return files[0]
+    exact_name = next((entry for entry in files if entry.name == expected_name), None)
+    if exact_name is not None:
+        return exact_name
+    if expected_size > 0:
+        matching_size = [entry for entry in files if entry.size == expected_size]
+        if len(matching_size) == 1:
+            return matching_size[0]
+    return None
+
+
 class OpenListPostCopyExecutor:
     """Copy organized files to OpenList target folders and optionally clean source."""
 
     _CHECKPOINT_VERSION = 1
     _MAX_POLL_ERRORS = 3
+    _TRANSFER_CHECK_MAX_RETRIES = 3
 
     def __init__(
         self,
@@ -79,18 +125,34 @@ class OpenListPostCopyExecutor:
         storage: OpenListStorageOperations,
         *,
         copy_target_paths: Iterable[str],
+        copy_mode: str = "copy",
+        copy_threads: int = _DEFAULT_COPY_THREADS,
+        aria2_rpc_url: str = "",
+        aria2_rpc_secret: str = "",
         delete_source_after_copy: bool = True,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         poll_interval_seconds: float = 5.0,
         verify_retries: int = 3,
     ) -> None:
+        normalized_mode = str(copy_mode or "copy").strip().lower()
+        if normalized_mode not in _SUPPORTED_COPY_MODES:
+            raise ValueError(
+                f"Unsupported OpenList copy_mode '{copy_mode}'. "
+                f"Supported modes: {', '.join(sorted(_SUPPORTED_COPY_MODES))}."
+            )
         self._client = client
         self._storage = storage
         self._copy_target_paths = normalize_copy_target_paths(copy_target_paths)
+        self._copy_mode = normalized_mode
+        self._copy_threads = max(1, min(_MAX_COPY_THREADS, int(copy_threads)))
+        self._aria2_rpc_url = str(aria2_rpc_url or "").strip()
+        self._aria2_rpc_secret = str(aria2_rpc_secret or "")
         self._delete_source_after_copy = bool(delete_source_after_copy)
         self._sleep = sleep
         self._poll_interval_seconds = max(0.0, float(poll_interval_seconds))
         self._verify_retries = max(1, int(verify_retries))
+        self._aria2_rpc_applied = False
+        self._aria2_rpc_warned = False
 
     @property
     def enabled(self) -> bool:
@@ -99,6 +161,14 @@ class OpenListPostCopyExecutor:
     @property
     def target_paths(self) -> tuple[str, ...]:
         return self._copy_target_paths
+
+    @property
+    def copy_mode(self) -> str:
+        return self._copy_mode
+
+    @property
+    def copy_threads(self) -> int:
+        return self._copy_threads
 
     @property
     def delete_source_after_copy(self) -> bool:
@@ -128,6 +198,7 @@ class OpenListPostCopyExecutor:
                 updated_results.append(result)
                 continue
             updated = await self._process_item(
+                job_id=job.id,
                 result=result,
                 base_path=base_path,
                 state=state,
@@ -149,6 +220,7 @@ class OpenListPostCopyExecutor:
     async def _process_item(
         self,
         *,
+        job_id: str,
         result: OrganizationResult,
         base_path: str,
         state: dict[str, Any],
@@ -181,8 +253,10 @@ class OpenListPostCopyExecutor:
             await persist()
 
         if item_state.get("state") != "completed":
-            for target_state in item_state["targets"]:
+            for target_index, target_state in enumerate(item_state["targets"]):
                 await self._process_target(
+                    job_id=job_id,
+                    target_index=target_index,
                     item_state=item_state,
                     target_state=target_state,
                     persist=persist,
@@ -274,6 +348,8 @@ class OpenListPostCopyExecutor:
     async def _process_target(
         self,
         *,
+        job_id: str,
+        target_index: int,
         item_state: dict[str, Any],
         target_state: dict[str, Any],
         persist: Callable[[], Awaitable[None]],
@@ -293,6 +369,20 @@ class OpenListPostCopyExecutor:
             raise OrganizationError(
                 f"Refusing to copy onto the same OpenList directory: '{dst_dir}'"
             )
+
+        if self._copy_mode == "aria2":
+            await self._process_aria2_target(
+                job_id=job_id,
+                target_index=target_index,
+                src_dir=src_dir,
+                target_root=target_root,
+                dst_dir=dst_dir,
+                filenames=filenames,
+                expected_sizes=expected_sizes,
+                target_state=target_state,
+                persist=persist,
+            )
+            return
 
         if target_state.get("state") == "pending":
             await self._submit_copy(
@@ -330,6 +420,675 @@ class OpenListPostCopyExecutor:
             logger.info(
                 f"OpenList copy completed: {src_dir} -> {dst_dir} "
                 f"({len(filenames)} file(s))"
+            )
+
+    async def _process_aria2_target(
+        self,
+        *,
+        job_id: str,
+        target_index: int,
+        src_dir: str,
+        target_root: str,
+        dst_dir: str,
+        filenames: list[str],
+        expected_sizes: dict[str, int],
+        target_state: dict[str, Any],
+        persist: Callable[[], Awaitable[None]],
+    ) -> None:
+        await self._ensure_target_directory(target_root, dst_dir)
+        dst_entries = await self._storage.list_directory(dst_dir)
+        by_name = {entry.name: entry for entry in dst_entries}
+
+        files_state = target_state.get("files")
+        if not isinstance(files_state, dict):
+            files_state = {}
+            target_state["files"] = files_state
+
+        changed = False
+        for name in filenames:
+            entry = by_name.get(name)
+            if entry is not None and entry.is_directory:
+                raise OrganizationError(
+                    f"Cannot copy '{name}' to '{dst_dir}': a directory with the same name exists"
+                )
+            if isinstance(files_state.get(name), dict):
+                continue
+            expected = expected_sizes.get(name, 0)
+            if entry is not None and (expected <= 0 or entry.size == expected):
+                files_state[name] = {"state": "completed"}
+            else:
+                files_state[name] = {"state": "pending"}
+            changed = True
+
+        if changed:
+            await persist()
+
+        pending_submission = any(
+            files_state[name].get("state") in {"pending", "submitting"}
+            for name in filenames
+        )
+        if pending_submission:
+            await self._configure_aria2_threads()
+
+        if all(files_state[name].get("state") == "completed" for name in filenames):
+            await self._verify_target_files(
+                dst_dir=dst_dir,
+                filenames=filenames,
+                expected_sizes=expected_sizes,
+                target_state=target_state,
+                persist=persist,
+            )
+            target_state["state"] = "completed"
+            target_state["task_ids"] = []
+            await persist()
+            logger.info(
+                f"OpenList copy already up to date in {dst_dir} "
+                f"({len(filenames)} file(s))"
+            )
+            return
+
+        for file_index, filename in enumerate(filenames):
+            file_state = files_state[filename]
+            if file_state.get("state") == "completed":
+                continue
+            await self._process_aria2_file(
+                job_id=job_id,
+                target_index=target_index,
+                file_index=file_index,
+                src_dir=src_dir,
+                target_root=target_root,
+                dst_dir=dst_dir,
+                filename=filename,
+                expected_size=expected_sizes.get(filename, 0),
+                file_state=file_state,
+                persist=persist,
+            )
+
+        await self._verify_target_files(
+            dst_dir=dst_dir,
+            filenames=filenames,
+            expected_sizes=expected_sizes,
+            target_state=target_state,
+            persist=persist,
+        )
+        target_state["state"] = "completed"
+        target_state["task_ids"] = []
+        await persist()
+        logger.info(
+            f"OpenList aria2 copy completed ({self._copy_threads} threads): "
+            f"{src_dir} -> {dst_dir} ({len(filenames)} file(s))"
+        )
+
+    async def _configure_aria2_threads(self) -> bool:
+        rpc_url = self._aria2_rpc_url
+        rpc_secret = self._aria2_rpc_secret
+
+        if not rpc_url:
+            settings = await self._client.get_admin_settings(
+                ["aria2_uri", "aria2_secret"]
+            )
+            if settings:
+                rpc_url = settings.get("aria2_uri", "").strip()
+                if not rpc_secret:
+                    rpc_secret = settings.get("aria2_secret", "")
+
+        if not rpc_url:
+            if not self._aria2_rpc_warned:
+                self._aria2_rpc_warned = True
+                logger.warning(
+                    f"Could not discover Aria2 RPC URL from OpenList to apply "
+                    f"copy_threads={self._copy_threads}; continuing with Aria2 defaults. "
+                    f"Set split={self._copy_threads} and "
+                    f"max-connection-per-server={self._copy_threads} in aria2.conf "
+                    "or configure [downloader.openlist] aria2_rpc_url."
+                )
+            return False
+
+        options = {
+            "split": str(self._copy_threads),
+            "max-connection-per-server": str(self._copy_threads),
+            "min-split-size": _ARIA2_MIN_SPLIT_SIZE,
+        }
+        ok = await self._client.configure_aria2_options(
+            rpc_url, options, secret=rpc_secret
+        )
+        if not ok and self._aria2_rpc_url and not rpc_secret:
+            settings = await self._client.get_admin_settings(["aria2_secret"])
+            discovered_secret = (settings or {}).get("aria2_secret", "")
+            if discovered_secret:
+                ok = await self._client.configure_aria2_options(
+                    rpc_url, options, secret=discovered_secret
+                )
+        if ok:
+            if not self._aria2_rpc_applied:
+                self._aria2_rpc_applied = True
+                self._aria2_rpc_warned = False
+                logger.info(
+                    f"Configured Aria2 global options for copy: "
+                    f"split={self._copy_threads}, "
+                    f"max-connection-per-server={self._copy_threads}, "
+                    f"min-split-size={_ARIA2_MIN_SPLIT_SIZE}"
+                )
+            else:
+                logger.debug(
+                    f"Refreshed Aria2 global options: split={self._copy_threads}, "
+                    f"max-connection-per-server={self._copy_threads}"
+                )
+            return True
+
+        self._aria2_rpc_applied = False
+        if not self._aria2_rpc_warned:
+            self._aria2_rpc_warned = True
+            logger.warning(
+                f"Could not apply Aria2 copy_threads={self._copy_threads} via RPC "
+                f"({rpc_url}); continuing with OpenList Aria2 defaults. To enforce "
+                f"{self._copy_threads}-thread downloads, set split={self._copy_threads} "
+                f"and max-connection-per-server={self._copy_threads} in aria2.conf "
+                "or configure [downloader.openlist] aria2_rpc_url."
+            )
+        return False
+
+    async def _process_aria2_file(
+        self,
+        *,
+        job_id: str,
+        target_index: int,
+        file_index: int,
+        src_dir: str,
+        target_root: str,
+        dst_dir: str,
+        filename: str,
+        expected_size: int,
+        file_state: dict[str, Any],
+        persist: Callable[[], Awaitable[None]],
+    ) -> None:
+        while file_state.get("state") != "completed":
+            current = str(file_state.get("state") or "pending")
+            if current == "pending":
+                staging_token = _make_staging_token(job_id, target_index, file_index)
+                staging_dir = _join_openlist_path(
+                    target_root, _COPY_TEMP_ROOT_DIR, staging_token
+                )
+                await self._ensure_target_directory(target_root, staging_dir)
+                file_state.clear()
+                file_state.update(
+                    {
+                        "state": "submitting",
+                        "staging_token": staging_token,
+                        "staging_dir": staging_dir,
+                        "task_id": "",
+                    }
+                )
+                await persist()
+                continue
+
+            staging_token = str(file_state.get("staging_token") or "")
+            staging_dir = str(file_state.get("staging_dir") or "")
+            if not staging_token or not staging_dir:
+                file_state.clear()
+                file_state["state"] = "pending"
+                await persist()
+                continue
+
+            if current == "submitting":
+                await self._submit_aria2_file(
+                    src_dir=src_dir,
+                    target_root=target_root,
+                    dst_dir=dst_dir,
+                    filename=filename,
+                    staging_token=staging_token,
+                    staging_dir=staging_dir,
+                    file_state=file_state,
+                    persist=persist,
+                )
+                continue
+
+            if current == "downloading":
+                task_id = str(file_state.get("task_id") or "")
+                if task_id:
+                    await self._wait_for_aria2_download_task(
+                        task_id=task_id,
+                        src_dir=src_dir,
+                        target_root=target_root,
+                        dst_dir=dst_dir,
+                        filename=filename,
+                        staging_token=staging_token,
+                        staging_dir=staging_dir,
+                        file_state=file_state,
+                        persist=persist,
+                    )
+                file_state["state"] = "transferring"
+                await persist()
+                continue
+
+            if current == "transferring":
+                await self._wait_for_aria2_transfer_task(
+                    src_dir=src_dir,
+                    target_root=target_root,
+                    dst_dir=dst_dir,
+                    filename=filename,
+                    expected_size=expected_size,
+                    staging_token=staging_token,
+                    staging_dir=staging_dir,
+                    file_state=file_state,
+                    persist=persist,
+                )
+                file_state["state"] = "finalizing"
+                await persist()
+                continue
+
+            if current == "finalizing":
+                await self._finalize_aria2_file(
+                    target_root=target_root,
+                    dst_dir=dst_dir,
+                    filename=filename,
+                    expected_size=expected_size,
+                    staging_token=staging_token,
+                    staging_dir=staging_dir,
+                    file_state=file_state,
+                    persist=persist,
+                )
+                file_state["state"] = "completed"
+                file_state["task_id"] = ""
+                await persist()
+                return
+
+            file_state.clear()
+            file_state["state"] = "pending"
+            await persist()
+
+    async def _submit_aria2_file(
+        self,
+        *,
+        src_dir: str,
+        target_root: str,
+        dst_dir: str,
+        filename: str,
+        staging_token: str,
+        staging_dir: str,
+        file_state: dict[str, Any],
+        persist: Callable[[], Awaitable[None]],
+    ) -> None:
+        existing = await self._find_existing_aria2_download_task(
+            staging_token, staging_dir
+        )
+        if existing is not None:
+            logger.info(
+                f"Resuming existing OpenList aria2 copy task for '{filename}' -> "
+                f"{dst_dir}: {existing.id}"
+            )
+            file_state["task_id"] = existing.id
+            file_state["state"] = "downloading"
+            await persist()
+            return
+
+        src_path = _join_openlist_path(src_dir, filename)
+        file_info = await self._client.get_file_info(src_path)
+        raw_url = _resolve_raw_url(file_info, getattr(self._client, "base_url", ""))
+        if not raw_url:
+            await self._reset_aria2_file_state(
+                target_root=target_root,
+                staging_token=staging_token,
+                file_state=file_state,
+                persist=persist,
+            )
+            raise OrganizationError(
+                f"Failed to retrieve raw_url from OpenList for '{src_path}'"
+            )
+
+        logger.info(
+            f"OpenList aria2 copy started ({self._copy_threads} threads): "
+            f"{src_path} -> {dst_dir}"
+        )
+        tasks = await self._client.add_offline_download(
+            urls=[raw_url],
+            path=staging_dir,
+            tool=_ARIA2_TOOL_NAME,
+            delete_policy="delete_always",
+        )
+        if not tasks or not tasks[0].id:
+            await self._reset_aria2_file_state(
+                target_root=target_root,
+                staging_token=staging_token,
+                file_state=file_state,
+                persist=persist,
+            )
+            raise OrganizationError(
+                f"Failed to start OpenList aria2 copy for '{src_path}' -> '{dst_dir}'"
+            )
+
+        file_state["task_id"] = tasks[0].id
+        file_state["state"] = "downloading"
+        await persist()
+
+    async def _find_existing_aria2_download_task(
+        self, staging_token: str, staging_dir: str
+    ) -> OpenlistTask | None:
+        undone = await self._client.get_offline_download_undone()
+        done = await self._client.get_offline_download_done()
+        if undone is None or done is None:
+            raise OrganizationError(
+                f"Cannot safely reconcile uncertain OpenList aria2 copy submission for '{staging_dir}'"
+            )
+        for task in (*undone, *done):
+            if not task.id:
+                continue
+            task_text = f"{task.name or ''} {task.status or ''}"
+            if staging_token in task_text or staging_dir in task_text:
+                return task
+        return None
+
+    async def _wait_for_aria2_download_task(
+        self,
+        *,
+        task_id: str,
+        src_dir: str,
+        target_root: str,
+        dst_dir: str,
+        filename: str,
+        staging_token: str,
+        staging_dir: str,
+        file_state: dict[str, Any],
+        persist: Callable[[], Awaitable[None]],
+    ) -> None:
+        consecutive_poll_errors = 0
+        logged_milestones: dict[str, int] = {}
+        while True:
+            undone = await self._client.get_offline_download_undone()
+            if undone is None:
+                consecutive_poll_errors += 1
+                if consecutive_poll_errors >= self._MAX_POLL_ERRORS:
+                    raise OrganizationError(
+                        f"Failed to poll OpenList undone aria2 download tasks for {dst_dir}"
+                    )
+                await self._sleep(self._poll_interval_seconds)
+                continue
+
+            matching = next((task for task in undone if task.id == task_id), None)
+            if matching is not None:
+                consecutive_poll_errors = 0
+                self._log_task_progress(
+                    matching, dst_dir, logged_milestones, label="aria2 download"
+                )
+                if self._is_complete_progress(
+                    matching.progress
+                ) and await self._aria2_transfer_task_exists(
+                    staging_token, staging_dir
+                ):
+                    logger.debug(
+                        f"OpenList aria2 download task {task_id} is at 100% and "
+                        "transfer task exists; advancing to transfer"
+                    )
+                    return
+                await self._sleep(self._poll_interval_seconds)
+                continue
+
+            done = await self._client.get_offline_download_done()
+            if done is None:
+                consecutive_poll_errors += 1
+                if consecutive_poll_errors >= self._MAX_POLL_ERRORS:
+                    raise OrganizationError(
+                        f"Failed to poll OpenList done aria2 download tasks for {dst_dir}"
+                    )
+                await self._sleep(self._poll_interval_seconds)
+                continue
+
+            consecutive_poll_errors = 0
+            finished = next((task for task in done if task.id == task_id), None)
+            if finished is None:
+                logger.warning(
+                    f"OpenList aria2 download task {task_id} not found in undone/done "
+                    f"lists; checking transfer/staging for '{filename}'"
+                )
+                return
+
+            if finished.state == OpenlistTaskState.SUCCEEDED:
+                return
+
+            self._log_terminal_copy_failure(finished, src_dir, dst_dir)
+            await self._reset_aria2_file_state(
+                target_root=target_root,
+                staging_token=staging_token,
+                file_state=file_state,
+                persist=persist,
+            )
+            details = finished.error or finished.status or finished.state
+            raise OrganizationError(
+                f"OpenList aria2 download task {task_id} failed for '{filename}' "
+                f"({src_dir} -> {dst_dir}): {details}"
+            )
+
+    async def _aria2_transfer_task_exists(
+        self, staging_token: str, staging_dir: str
+    ) -> bool:
+        undone = await self._client.get_offline_download_transfer_undone()
+        if undone and self._match_transfer_task(undone, staging_token, staging_dir):
+            return True
+        done = await self._client.get_offline_download_transfer_done()
+        return bool(
+            done and self._match_transfer_task(done, staging_token, staging_dir)
+        )
+
+    @staticmethod
+    def _match_transfer_task(
+        tasks: list[OpenlistTask], staging_token: str, staging_dir: str
+    ) -> OpenlistTask | None:
+        for task in tasks:
+            name = task.name or ""
+            if staging_token in name or staging_dir in name:
+                return task
+        return None
+
+    async def _wait_for_aria2_transfer_task(
+        self,
+        *,
+        src_dir: str,
+        target_root: str,
+        dst_dir: str,
+        filename: str,
+        expected_size: int,
+        staging_token: str,
+        staging_dir: str,
+        file_state: dict[str, Any],
+        persist: Callable[[], Awaitable[None]],
+    ) -> None:
+        consecutive_poll_errors = 0
+        not_found_count = 0
+        logged_milestones: dict[str, int] = {}
+
+        while True:
+            undone = await self._client.get_offline_download_transfer_undone()
+            if undone is None:
+                consecutive_poll_errors += 1
+                if consecutive_poll_errors >= self._MAX_POLL_ERRORS:
+                    raise OrganizationError(
+                        f"Failed to poll OpenList undone aria2 transfer tasks for {dst_dir}"
+                    )
+                await self._sleep(self._poll_interval_seconds)
+                continue
+
+            matching_undone = self._match_transfer_task(
+                undone, staging_token, staging_dir
+            )
+            if matching_undone is not None:
+                consecutive_poll_errors = 0
+                not_found_count = 0
+                self._log_task_progress(
+                    matching_undone,
+                    dst_dir,
+                    logged_milestones,
+                    label="aria2 transfer",
+                )
+                await self._sleep(self._poll_interval_seconds)
+                continue
+
+            done = await self._client.get_offline_download_transfer_done()
+            if done is None:
+                consecutive_poll_errors += 1
+                if consecutive_poll_errors >= self._MAX_POLL_ERRORS:
+                    raise OrganizationError(
+                        f"Failed to poll OpenList done aria2 transfer tasks for {dst_dir}"
+                    )
+                await self._sleep(self._poll_interval_seconds)
+                continue
+
+            consecutive_poll_errors = 0
+            matching_done = self._match_transfer_task(done, staging_token, staging_dir)
+            if matching_done is not None:
+                if matching_done.state == OpenlistTaskState.SUCCEEDED:
+                    return
+                self._log_terminal_copy_failure(matching_done, src_dir, dst_dir)
+                await self._reset_aria2_file_state(
+                    target_root=target_root,
+                    staging_token=staging_token,
+                    file_state=file_state,
+                    persist=persist,
+                )
+                details = (
+                    matching_done.error or matching_done.status or matching_done.state
+                )
+                raise OrganizationError(
+                    f"OpenList aria2 transfer task {matching_done.id} failed for "
+                    f"'{filename}' ({src_dir} -> {dst_dir}): {details}"
+                )
+
+            staged_entries = await self._client.list_files(staging_dir)
+            if staged_entries:
+                storage_entries = tuple(
+                    StorageEntry(
+                        name=entry.name,
+                        is_directory=bool(getattr(entry, "is_dir", False)),
+                        size=(
+                            entry.size
+                            if isinstance(getattr(entry, "size", None), int)
+                            else 0
+                        ),
+                    )
+                    for entry in staged_entries
+                )
+                staged = _select_staged_file(storage_entries, filename, expected_size)
+                if staged is not None and (
+                    expected_size <= 0 or staged.size == expected_size
+                ):
+                    return
+
+            not_found_count += 1
+            if not_found_count >= self._TRANSFER_CHECK_MAX_RETRIES:
+                logger.debug(
+                    f"No transfer task found for {staging_token} after "
+                    f"{self._TRANSFER_CHECK_MAX_RETRIES} checks; verifying staging directory"
+                )
+                return
+
+            await self._sleep(self._poll_interval_seconds)
+
+    async def _finalize_aria2_file(
+        self,
+        *,
+        target_root: str,
+        dst_dir: str,
+        filename: str,
+        expected_size: int,
+        staging_token: str,
+        staging_dir: str,
+        file_state: dict[str, Any],
+        persist: Callable[[], Awaitable[None]],
+    ) -> None:
+        dst_entries = await self._storage.list_directory(dst_dir)
+        existing_dst = next(
+            (entry for entry in dst_entries if entry.name == filename), None
+        )
+        if existing_dst is not None and existing_dst.is_directory:
+            raise OrganizationError(
+                f"Cannot copy '{filename}' to '{dst_dir}': a directory with the same name exists"
+            )
+        if existing_dst is not None and (
+            expected_size <= 0 or existing_dst.size == expected_size
+        ):
+            await self._safe_cleanup_staging_dir(target_root, staging_token)
+            return
+
+        staged: StorageEntry | None = None
+        last_problem = f"no downloaded file found in '{staging_dir}'"
+        for attempt in range(self._verify_retries):
+            staging_entries = await self._storage.list_directory(staging_dir)
+            candidate = _select_staged_file(staging_entries, filename, expected_size)
+            if candidate is None:
+                last_problem = f"no downloaded file found in '{staging_dir}'"
+            elif expected_size > 0 and candidate.size != expected_size:
+                last_problem = (
+                    f"size mismatch for '{filename}' "
+                    f"(expected {expected_size}, got {candidate.size})"
+                )
+            else:
+                staged = candidate
+                break
+            if attempt + 1 < self._verify_retries:
+                await self._storage._refresh_wait()
+
+        if staged is None:
+            await self._reset_aria2_file_state(
+                target_root=target_root,
+                staging_token=staging_token,
+                file_state=file_state,
+                persist=persist,
+            )
+            raise OrganizationError(
+                f"OpenList aria2 copy verification failed for '{filename}': {last_problem}"
+            )
+
+        if staged.name != filename:
+            logger.debug(
+                f"Renaming aria2 copied file '{staged.name}' -> '{filename}' "
+                f"in {staging_dir}"
+            )
+            await self._storage.rename(
+                _join_openlist_path(staging_dir, staged.name),
+                filename,
+            )
+
+        if existing_dst is not None:
+            await self._storage.remove_files(dst_dir, (filename,))
+
+        await self._storage.move(staging_dir, dst_dir, (filename,))
+        await self._safe_cleanup_staging_dir(target_root, staging_token)
+
+    async def _reset_aria2_file_state(
+        self,
+        *,
+        target_root: str,
+        staging_token: str,
+        file_state: dict[str, Any],
+        persist: Callable[[], Awaitable[None]],
+    ) -> None:
+        await self._safe_cleanup_staging_dir(target_root, staging_token)
+        file_state.clear()
+        file_state["state"] = "pending"
+        await persist()
+
+    async def _safe_cleanup_staging_dir(
+        self, target_root: str, staging_token: str
+    ) -> None:
+        if (
+            not staging_token
+            or "/" in staging_token
+            or "\\" in staging_token
+            or staging_token in {".", ".."}
+        ):
+            return
+        temp_root = _join_openlist_path(target_root, _COPY_TEMP_ROOT_DIR)
+        try:
+            entries = await self._client.list_files(temp_root)
+            if not entries or not any(entry.name == staging_token for entry in entries):
+                return
+            removed = await self._client.remove_path(temp_root, [staging_token])
+            if not removed:
+                logger.warning(
+                    f"Failed to remove aria2 copy staging directory '{temp_root}/{staging_token}'"
+                )
+        except Exception as exc:
+            logger.warning(
+                f"Failed to clean up aria2 copy staging directory '{temp_root}/{staging_token}': {exc}"
             )
 
     async def _submit_copy(
@@ -477,7 +1236,7 @@ class OpenListPostCopyExecutor:
             undone_by_id = {task.id: task for task in undone if task.id}
             still_running = [tid for tid in remaining if tid in undone_by_id]
             for tid in still_running:
-                self._log_copy_progress(undone_by_id[tid], dst_dir, logged_milestones)
+                self._log_task_progress(undone_by_id[tid], dst_dir, logged_milestones)
             settled_candidates = remaining - set(still_running)
 
             if settled_candidates:
@@ -528,8 +1287,21 @@ class OpenListPostCopyExecutor:
                 await self._sleep(self._poll_interval_seconds)
 
     @staticmethod
-    def _log_copy_progress(
-        task: OpenlistTask, dst_dir: str, logged_milestones: dict[str, int]
+    def _is_complete_progress(progress: Any) -> bool:
+        if progress is None:
+            return False
+        try:
+            return float(progress) >= 100.0
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _log_task_progress(
+        task: OpenlistTask,
+        dst_dir: str,
+        logged_milestones: dict[str, int],
+        *,
+        label: str = "copy",
     ) -> None:
         if task.progress is None:
             return
@@ -541,7 +1313,7 @@ class OpenListPostCopyExecutor:
         if milestone >= 25 and milestone > logged_milestones.get(task.id, 0):
             logged_milestones[task.id] = milestone
             logger.info(
-                f"OpenList copy in progress ({progress:.0f}%): "
+                f"OpenList {label} in progress ({progress:.0f}%): "
                 f"task={task.id}, dst={dst_dir}"
             )
 
@@ -577,6 +1349,8 @@ class OpenListPostCopyExecutor:
 
         target_state["state"] = "pending"
         target_state["task_ids"] = []
+        if "files" in target_state:
+            target_state["files"] = {}
         await persist()
         raise OrganizationError(
             f"OpenList copy verification failed for '{dst_dir}': {last_problem}"
@@ -599,6 +1373,19 @@ def _check_entries_complete(
     return ""
 
 
+def _copy_target_state(target: dict[str, Any]) -> dict[str, Any]:
+    copied = {
+        **target,
+        "task_ids": list(target.get("task_ids", [])),
+    }
+    if isinstance(target.get("files"), dict):
+        copied["files"] = {
+            str(name): (dict(fstate) if isinstance(fstate, dict) else fstate)
+            for name, fstate in target["files"].items()
+        }
+    return copied
+
+
 def _copy_state(state: dict[str, Any]) -> dict[str, Any]:
     return {
         "version": state.get("version", 1),
@@ -608,11 +1395,7 @@ def _copy_state(state: dict[str, Any]) -> dict[str, Any]:
                 "filenames": list(item.get("filenames", [])),
                 "expected_sizes": dict(item.get("expected_sizes", {})),
                 "targets": [
-                    {
-                        **target,
-                        "task_ids": list(target.get("task_ids", [])),
-                    }
-                    for target in item.get("targets", [])
+                    _copy_target_state(target) for target in item.get("targets", [])
                 ],
             }
             for key, item in state.get("items", {}).items()

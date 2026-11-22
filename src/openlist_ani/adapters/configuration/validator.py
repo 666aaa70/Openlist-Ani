@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import posixpath
+from urllib.parse import urlparse
 
 from openlist_ani.logger import FATAL_LEVEL, logger
 from openlist_ani.application.settings import CoreSettings
@@ -92,6 +93,22 @@ class ConfigValidator:
             )
 
         self._validate_copy_target_paths(openlist.copy_target_paths, errors)
+        self._validate_aria2_rpc_url(openlist.aria2_rpc_url, errors)
+
+    @staticmethod
+    def _validate_aria2_rpc_url(rpc_url: str, errors: list[str]) -> None:
+        stripped = rpc_url.strip()
+        if not stripped:
+            return
+        parsed = urlparse(stripped)
+        if (
+            parsed.scheme.lower() not in {"http", "https", "ws", "wss"}
+            or not parsed.netloc
+        ):
+            errors.append(
+                "OpenList aria2_rpc_url must be a valid http(s):// or ws(s):// URL: "
+                f"'{rpc_url}'."
+            )
 
     def _validate_copy_target_paths(
         self, target_paths: list[str], errors: list[str]

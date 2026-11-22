@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from openlist_ani.logger import logger
@@ -18,10 +19,13 @@ class OpenListHealthCheck:
         client: OpenListClient,
         base_url: str,
         offline_download_tool: OfflineDownloadTool | str,
+        *,
+        extra_required_tools: Iterable[OfflineDownloadTool | str] = (),
     ) -> None:
         self._client = client
         self._base_url = base_url
         self._offline_download_tool = offline_download_tool
+        self._extra_required_tools = tuple(extra_required_tools)
 
     async def validate(self) -> bool:
         logger.debug("Verifying OpenList server health")
@@ -55,6 +59,26 @@ class OpenListHealthCheck:
             "Offline download tool "
             f"'{available_by_casefold[tool_str.casefold()]}' is available"
         )
+
+        seen = {tool_str.casefold()}
+        for extra_tool in self._extra_required_tools:
+            extra_name = normalize_offline_download_tool_name(extra_tool)
+            key = extra_name.casefold()
+            if not extra_name or key in seen:
+                continue
+            seen.add(key)
+            if key not in available_by_casefold:
+                logger.warning(
+                    f"Required OpenList offline download tool '{extra_name}' is not "
+                    f"available on the server. Available tools: {available_names}. "
+                    "Please configure it in OpenList or switch [downloader.openlist] "
+                    "copy_mode to 'copy'."
+                )
+                return False
+            logger.debug(
+                f"Extra offline download tool '{available_by_casefold[key]}' is available"
+            )
+
         return True
 
     @staticmethod

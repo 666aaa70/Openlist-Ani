@@ -33,6 +33,10 @@ class OpenListOrganizerAdapter:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         *,
         copy_target_paths: Iterable[str] = (),
+        copy_mode: str = "copy",
+        copy_threads: int = 8,
+        aria2_rpc_url: str = "",
+        aria2_rpc_secret: str = "",
         delete_source_after_copy: bool = True,
     ) -> None:
         self._client = client
@@ -42,6 +46,10 @@ class OpenListOrganizerAdapter:
             client,
             self._storage,
             copy_target_paths=copy_target_paths,
+            copy_mode=copy_mode,
+            copy_threads=copy_threads,
+            aria2_rpc_url=aria2_rpc_url,
+            aria2_rpc_secret=aria2_rpc_secret,
             delete_source_after_copy=delete_source_after_copy,
             sleep=sleep,
         )

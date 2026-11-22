@@ -204,6 +204,30 @@ def test_empty_rss_urls_config_is_ready_to_run(payload):
                 },
             }
         },
+        {
+            "downloader": {
+                "download_path": "/PikPak/Anime",
+                "openlist": {
+                    "url": "http://localhost:5244",
+                    "token": "token",
+                    "copy_target_paths": ["/115/Anime"],
+                    "copy_mode": "aria2",
+                    "aria2_rpc_url": "ftp://aria2:6800/jsonrpc",
+                },
+            }
+        },
+        {
+            "downloader": {
+                "download_path": "/PikPak/Anime",
+                "openlist": {
+                    "url": "http://localhost:5244",
+                    "token": "token",
+                    "copy_target_paths": ["/115/Anime"],
+                    "copy_mode": "aria2",
+                    "aria2_rpc_url": "http://",
+                },
+            }
+        },
     ],
     ids=[
         "empty-config-missing-token",
@@ -217,6 +241,8 @@ def test_empty_rss_urls_config_is_ready_to_run(payload):
         "traversal-copy-target-path",
         "copy-target-equals-download-path",
         "copy-target-double-slash-equals-download-path",
+        "unsupported-aria2-rpc-scheme",
+        "missing-aria2-rpc-host",
     ],
 )
 def test_missing_required_runtime_settings_are_rejected(payload):
@@ -242,7 +268,34 @@ def test_openlist_copy_target_paths_config_is_validated():
         "/115/Anime",
         "/Local/Anime",
     ]
+    assert config.downloader.openlist.copy_mode == "copy"
+    assert config.downloader.openlist.copy_threads == 8
     assert config.downloader.openlist.delete_source_after_copy is True
+    assert ConfigValidator(config).validate() is True
+
+
+def test_openlist_aria2_copy_mode_config_defaults_to_8_threads():
+    config = UserConfig.model_validate(
+        {
+            "downloader": {
+                "download_path": "/PikPak/Anime",
+                "openlist": {
+                    "url": "http://localhost:5244",
+                    "token": "token",
+                    "offline_download_tool": "PikPak",
+                    "copy_target_paths": ["/115/Anime"],
+                    "copy_mode": " ARIA2 ",
+                    "aria2_rpc_url": " ws://aria2:6800/jsonrpc ",
+                    "aria2_rpc_secret": "rpc-secret",
+                },
+            }
+        }
+    )
+
+    assert config.downloader.openlist.copy_mode == "aria2"
+    assert config.downloader.openlist.copy_threads == 8
+    assert config.downloader.openlist.aria2_rpc_url == "ws://aria2:6800/jsonrpc"
+    assert config.downloader.openlist.aria2_rpc_secret == "rpc-secret"
     assert ConfigValidator(config).validate() is True
 
 
@@ -273,6 +326,9 @@ def test_enabled_optional_features_require_a_usable_configuration(overrides):
     [
         lambda: OpenListConfig(offline_download_tool=""),
         lambda: OpenListConfig.model_validate({"copy_target_paths": "/115/Anime"}),
+        lambda: OpenListConfig(copy_mode="rclone"),
+        lambda: OpenListConfig(copy_threads=0),
+        lambda: OpenListConfig(copy_threads=17),
         lambda: DownloaderConfig(rename_format="{unsupported}"),
         lambda: MetadataFilterConfig(exclude_patterns=["[invalid"]),
         lambda: NotificationConfig(batch_interval=-1),
@@ -287,6 +343,9 @@ def test_enabled_optional_features_require_a_usable_configuration(overrides):
     ids=[
         "empty-tool",
         "non-list-copy-target-paths",
+        "invalid-copy-mode",
+        "zero-copy-threads",
+        "too-many-copy-threads",
         "bad-rename-field",
         "bad-filter-regex",
         "negative-batch",

@@ -25,13 +25,18 @@
 - 仍保留对无效 RSS 配置的校验（如空白 URL、`interval_time <= 0`、无效正则/优先级字段等）。
 - `rss.urls` 为空时跳过订阅轮询抓取，手动下载 API（`POST /api/downloads` 等）、PikPak 离线下载、番剧识别与重命名功能保持正常；后续也可通过 `POST /api/rss` 动态添加订阅恢复抓取。
 
-### 2. 下载整理后自动复制到 OpenList 其他文件夹并删除源文件
+### 2. 下载整理后自动复制到 OpenList 其他文件夹并删除源文件（支持 Aria2 多线程加速）
 
 - 在 `[downloader.openlist]` 新增以下可选配置（对所有 OpenList 离线下载工具生效，包括 PikPak）：
   - `copy_target_paths`：目标文件夹路径列表（默认 `[]`，为空时不启用复制；支持配置一个或多个路径，禁止与 `downloader.download_path` 相同）。
+  - `copy_mode`：复制传输模式（默认 `"copy"`）：
+    - `"copy"`：调用 OpenList 原生 `/api/fs/copy`（跨存储为单线程流式复制，零额外依赖）。
+    - `"aria2"`：**多线程加速复制**（推荐用于 PikPak 等对单连接限速的网盘）。通过 `/api/fs/get` 获取源文件直链，自动调用 OpenList 的 `aria2` 离线下载到目标存储的临时目录（`.oani-copy-tmp`），下载并转存完成后自动校正文件名、秒移至目标目录并清理临时目录。
+  - `copy_threads`：`copy_mode = "aria2"` 时的多线程数（范围 `1-16`，默认 `8`）。提交前会自动尝试通过 Aria2 JSON-RPC（`aria2.changeGlobalOption`）设置 `split`、`max-connection-per-server` 与 `min-split-size=1M`；若跨容器无法直连 Aria2 RPC，则回退使用 Aria2 配置文件中的默认值并在日志提示。
+  - `aria2_rpc_url` / `aria2_rpc_secret`（可选）：显式指定 Aria2 JSON-RPC 地址与密钥；留空时会自动从 OpenList 管理设置（`aria2_uri` / `aria2_secret`）读取。
   - `delete_source_after_copy`：所有目标复制校验完成后是否删除原下载目录中的源文件（默认 `true`，节省 PikPak 等中转网盘空间；如需保留源文件可设为 `false`）。
 - 工作流程：番剧识别、重命名并整理到 `<download_path>/<番剧名>/Season <季>/` 后，按相同的 `<番剧名>/Season <季>/` 子目录结构将视频和关联字幕复制到所有目标文件夹。
-- 安全与容错：兼容 OpenList 跨存储异步复制（轮询 `/api/task/copy/*` 等待完成）和同存储同步复制，支持中断后断点恢复；**只有全部目标目录均复制成功并校验文件存在且大小一致后**，才会删除源文件并更新任务 `final_path`，任何目标失败均会重试且绝不提前删除源文件。
+- 安全与容错：兼容 OpenList 跨存储异步复制、同存储同步复制及 Aria2 多线程复制，支持中断后断点恢复；**只有全部目标目录均复制成功并校验文件存在且大小一致后**，才会删除源文件并更新任务 `final_path`，任何目标失败均会重试且绝不提前删除源文件。
 
 ### 3. 自动构建 AMD64/ARM64 GHCR 镜像（支持 1Panel V2 部署）
 
@@ -40,7 +45,7 @@
   - `ghcr.io/666aaa70/openlist-ani:latest`（跟踪 `master` 最新版）
   - `ghcr.io/666aaa70/openlist-ani:master` / `ghcr.io/666aaa70/openlist-ani:sha-<commit>`
 
-#### 快速配置示例（空 RSS + PikPak 离线下载 + 自动复制到目标目录）
+#### 快速配置示例（空 RSS + PikPak 离线下载 + Aria2 8 线程复制到目标目录）
 
 ```toml
 config_version = 2
@@ -61,6 +66,10 @@ url = "http://openlist:5244"
 token = "你的OpenList令牌"
 offline_download_tool = "PikPak"
 copy_target_paths = ["/115/Anime"] # 支持多个目标路径，如 ["/115/Anime", "/Local/Anime"]
+copy_mode = "aria2"                # 可选 "copy"（默认）或 "aria2"（多线程加速，需先在 OpenList 配置 Aria2）
+copy_threads = 8                   # Aria2 线程数（1-16，默认 8）
+# aria2_rpc_url = "http://aria2:6800/jsonrpc" # 可选，留空则自动从 OpenList 读取
+# aria2_rpc_secret = "你的Aria2密钥"           # 可选，留空则自动从 OpenList 读取
 delete_source_after_copy = true    # 复制校验完成后自动删除 PikPak 原文件
 
 [metadata]

@@ -10,6 +10,21 @@ from openlist_ani.logger import logger
 from .models import FileEntry, OfflineDownloadTool, OpenlistTask
 
 
+def _normalize_aria2_http_rpc_url(rpc_url: str) -> str:
+    """Convert an Aria2 RPC URL (http/https/ws/wss) into an HTTP(S) JSON-RPC endpoint."""
+    stripped = str(rpc_url or "").strip()
+    if not stripped:
+        return ""
+    lowered = stripped.lower()
+    if lowered.startswith("ws://"):
+        return f"http://{stripped[5:]}"
+    if lowered.startswith("wss://"):
+        return f"https://{stripped[6:]}"
+    if lowered.startswith(("http://", "https://")):
+        return stripped
+    return ""
+
+
 class OpenListClient:
     UNKNOWN_ERROR_MESSAGE = "Unknown error"
 
@@ -246,6 +261,88 @@ class OpenListClient:
             msg = data.get("message") if data else self.UNKNOWN_ERROR_MESSAGE
             logger.warning(f"Failed to list files at {path}: {msg}")
             return None
+
+    async def get_file_info(self, path: str) -> dict[str, Any] | None:
+        """Fetch file metadata (including direct ``raw_url``) via ``/api/fs/get``."""
+        if not self.token:
+            return None
+
+        url = f"{self.base_url}/api/fs/get"
+        payload = {"path": path, "password": ""}
+
+        data = await self._post(url, payload)
+        if data and data.get("code") == 200 and isinstance(data.get("data"), dict):
+            return data["data"]
+        msg = data.get("message") if data else self.UNKNOWN_ERROR_MESSAGE
+        logger.warning(f"Failed to get file info at {path}: {msg}")
+        return None
+
+    async def get_admin_settings(self, keys: list[str]) -> dict[str, str] | None:
+        """Best-effort fetch of OpenList admin settings by key."""
+        if not self.token:
+            return None
+        cleaned = [key.strip() for key in keys if key and key.strip()]
+        if not cleaned:
+            return {}
+
+        url = f"{self.base_url}/api/admin/setting/get"
+        data = await self._get(url, params={"keys": ",".join(cleaned)})
+        if not data or data.get("code") != 200:
+            msg = data.get("message") if data else self.UNKNOWN_ERROR_MESSAGE
+            logger.debug(f"Could not read OpenList admin settings {cleaned}: {msg}")
+            return None
+
+        raw_items = data.get("data")
+        if isinstance(raw_items, dict) and "key" in raw_items:
+            raw_items = [raw_items]
+        if not isinstance(raw_items, list):
+            return {}
+
+        result: dict[str, str] = {}
+        for item in raw_items:
+            if isinstance(item, dict) and item.get("key"):
+                result[str(item["key"])] = str(item.get("value") or "")
+        return result
+
+    async def configure_aria2_options(
+        self,
+        rpc_url: str,
+        options: dict[str, str],
+        *,
+        secret: str = "",
+    ) -> bool:
+        """Apply global options to an Aria2 JSON-RPC endpoint (best-effort)."""
+        endpoint = _normalize_aria2_http_rpc_url(rpc_url)
+        if not endpoint:
+            return False
+
+        params: list[Any] = [f"token:{secret}", options] if secret else [options]
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "openlist-ani-copy",
+            "method": "aria2.changeGlobalOption",
+            "params": params,
+        }
+        timeout = aiohttp.ClientTimeout(total=5.0, connect=3.0, sock_read=5.0)
+        try:
+            async with aiohttp.ClientSession(
+                timeout=timeout, trust_env=True
+            ) as session:
+                async with session.post(endpoint, json=payload) as response:
+                    response.raise_for_status()
+                    body = await response.json(content_type=None)
+        except Exception as exc:
+            logger.debug(f"Aria2 JSON-RPC request to {endpoint} failed: {exc}")
+            return False
+
+        if (
+            isinstance(body, dict)
+            and body.get("result") == "OK"
+            and "error" not in body
+        ):
+            return True
+        logger.debug(f"Aria2 JSON-RPC changeGlobalOption rejected: {body}")
+        return False
 
     async def rename_file(self, full_path: str, new_name: str) -> bool:
         """Rename a file at *full_path* to *new_name*."""

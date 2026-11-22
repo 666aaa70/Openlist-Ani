@@ -82,11 +82,16 @@ class _FakePikPakOpenListClient:
 
     def __init__(self, downloaded_filename: str) -> None:
         self._downloaded_filename = downloaded_filename
+        self.base_url = "http://127.0.0.1:5244"
         self.offline_calls: list[dict[str, object]] = []
         self.copy_calls: list[dict[str, object]] = []
+        self.aria2_rpc_calls: list[dict[str, object]] = []
         self._copy_tasks_undone: list[OpenlistTask] = []
         self._copy_tasks_done: list[OpenlistTask] = []
         self._copy_payloads: dict[str, tuple[str, str, str]] = {}
+        self._offline_tasks_done: list[OpenlistTask] = []
+        self._transfer_tasks_done: list[OpenlistTask] = []
+        self._url_sources: dict[str, tuple[str, str]] = {}
         self._dirs: dict[str, dict[str, SimpleNamespace]] = {
             "/": {},
             "/PikPak": {},
@@ -113,7 +118,36 @@ class _FakePikPakOpenListClient:
         return True
 
     async def get_offline_download_tools(self) -> list[str]:
-        return ["PikPak"]
+        return ["PikPak", "aria2"]
+
+    async def get_admin_settings(self, keys: list[str]) -> dict[str, str]:
+        defaults = {
+            "aria2_uri": "http://aria2:6800/jsonrpc",
+            "aria2_secret": "smoke-secret",
+        }
+        return {k: defaults[k] for k in keys if k in defaults}
+
+    async def configure_aria2_options(
+        self,
+        rpc_url: str,
+        options: dict[str, str],
+        *,
+        secret: str = "",
+    ) -> bool:
+        self.aria2_rpc_calls.append(
+            {"rpc_url": rpc_url, "options": dict(options), "secret": secret}
+        )
+        return True
+
+    async def get_file_info(self, path: str) -> dict[str, object] | None:
+        normalized = posixpath.normpath(path)
+        parent, name = posixpath.split(normalized)
+        entry = self._dirs.get(parent, {}).get(name)
+        if entry is None:
+            return None
+        url = f"https://pikpak.cdn.test/{len(self._url_sources) + 1}/{name}"
+        self._url_sources[url] = (parent, name)
+        return {"name": name, "size": entry.size, "is_dir": False, "raw_url": url}
 
     async def add_offline_download(
         self,
@@ -125,30 +159,58 @@ class _FakePikPakOpenListClient:
     ) -> list[OpenlistTask]:
         self.offline_calls.append({"urls": list(urls), "path": path, "tool": tool})
         entries = self._ensure_dir(path)
+        seq = len(self.offline_calls)
+        if str(tool).lower() == "aria2":
+            src_dir, src_name = self._url_sources[urls[0]]
+            src_entry = self._dirs[src_dir][src_name]
+            entries["aria2_raw_download.mkv"] = SimpleNamespace(
+                name="aria2_raw_download.mkv",
+                is_dir=False,
+                size=src_entry.size,
+            )
+            tid = f"aria2-task-{seq}"
+            task = OpenlistTask(
+                id=tid,
+                name=f"download {urls[0]} to ({path})",
+                state=OpenlistTaskState.SUCCEEDED,
+                progress=100,
+            )
+            self._offline_tasks_done.append(task)
+            self._transfer_tasks_done.append(
+                OpenlistTask(
+                    id=f"aria2-tx-{seq}",
+                    name=f"transfer [](/tmp/aria2/file) to [{path}]",
+                    state=OpenlistTaskState.SUCCEEDED,
+                    progress=100,
+                )
+            )
+            return [task]
+
         entries[self._downloaded_filename] = SimpleNamespace(
             name=self._downloaded_filename,
             is_dir=False,
             size=1024,
         )
-        return [OpenlistTask(id="pikpak-task-1", name="pikpak-download")]
+        tid = f"pikpak-task-{seq}"
+        task = OpenlistTask(
+            id=tid,
+            name="pikpak-download",
+            state=OpenlistTaskState.SUCCEEDED,
+        )
+        self._offline_tasks_done.append(task)
+        return [task]
 
     async def get_offline_download_undone(self) -> list[OpenlistTask]:
         return []
 
     async def get_offline_download_done(self) -> list[OpenlistTask]:
-        return [
-            OpenlistTask(
-                id="pikpak-task-1",
-                name="pikpak-download",
-                state=OpenlistTaskState.SUCCEEDED,
-            )
-        ]
+        return list(self._offline_tasks_done)
 
     async def get_offline_download_transfer_undone(self) -> list[OpenlistTask]:
         return []
 
     async def get_offline_download_transfer_done(self) -> list[OpenlistTask]:
-        return []
+        return list(self._transfer_tasks_done)
 
     async def list_files(self, path: str) -> list[SimpleNamespace]:
         normalized = posixpath.normpath(path)
@@ -472,6 +534,123 @@ pipeline = ["regex"]
                 "overwrite": False,
             }
             assert expected_name in fake_client._dirs["/115/Anime/Frieren/Season 1"]
+            assert (
+                expected_name not in fake_client._dirs["/PikPak/Anime/Frieren/Season 1"]
+            )
+    finally:
+        await assembly.runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_pikpak_download_aria2_copy_defaults_to_8_threads_end_to_end(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+config_version = 2
+
+[rss]
+urls = []
+
+[downloader]
+download_path = "/PikPak/Anime"
+rename_format = "{anime_name} S{season:02d}E{episode:02d} {fansub} {quality} {languages}"
+
+[downloader.openlist]
+url = "http://127.0.0.1:5244"
+token = "test-token"
+offline_download_tool = "PikPak"
+copy_target_paths = ["/115/Anime"]
+copy_mode = "aria2"
+delete_source_after_copy = true
+
+[metadata]
+pipeline = ["regex"]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CONFIG_PATH", str(config_path))
+    monkeypatch.setattr(config_loader, "_config_instance", None)
+    monkeypatch.setattr(BackendApiService, "_instance", None)
+
+    raw_filename = "[Lilith-Raws] Frieren - 01 [1080p][CHT].mkv"
+    fake_client = _FakePikPakOpenListClient(raw_filename)
+    original_bundle_factory = backend_module._create_openlist_backend_bundle
+
+    def _patched_bundle(cfg, *, client=None):
+        bundle = original_bundle_factory(cfg, client=client or fake_client)
+        bundle.downloader._sleep = AsyncMock()
+        bundle.organizer._storage._sleep = AsyncMock()
+        bundle.organizer._storage._cache_refresh_seconds = 0
+        bundle.organizer._post_copy._sleep = AsyncMock()
+        bundle.organizer._post_copy._poll_interval_seconds = 0
+        return bundle
+
+    monkeypatch.setattr(
+        backend_module, "_create_openlist_backend_bundle", _patched_bundle
+    )
+
+    config, settings = _load_runtime_config()
+    LegacyMigrationRunner().run()
+    assembly = await _compose_runtime(config, settings)
+
+    await backend_module._check_download_backend_health(assembly)
+    await assembly.runtime.start()
+    BackendApiService.init(assembly.application)
+    app = create_app()
+
+    magnet_url = "magnet:?xt=urn:btih:00112233445566778899aabbccddeeff00112233"
+    release_title = "[Lilith-Raws] Frieren - 01 [1080p][CHT]"
+    expected_name = "Frieren S01E01 Lilith-Raws 1080p 繁.mkv"
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as http_client:
+            create_resp = await http_client.post(
+                "/api/downloads",
+                json={"download_url": magnet_url, "title": release_title},
+            )
+            assert create_resp.status_code == 200
+            task_id = create_resp.json()["task"]["id"]
+
+            final_task = None
+            for _ in range(100):
+                detail_resp = await http_client.get(f"/api/downloads/{task_id}")
+                assert detail_resp.status_code == 200
+                detail = detail_resp.json()
+                if detail["state"] in {"completed", "failed", "cancelled"}:
+                    final_task = detail
+                    break
+                await asyncio.sleep(0.05)
+
+            assert final_task is not None
+            assert final_task["state"] == "completed", final_task
+            assert (
+                final_task["final_path"]
+                == f"/115/Anime/Frieren/Season 1/{expected_name}"
+            )
+            assert fake_client.copy_calls == []
+            assert [call["tool"] for call in fake_client.offline_calls] == [
+                "PikPak",
+                "aria2",
+            ]
+            assert fake_client.aria2_rpc_calls == [
+                {
+                    "rpc_url": "http://aria2:6800/jsonrpc",
+                    "options": {
+                        "split": "8",
+                        "max-connection-per-server": "8",
+                        "min-split-size": "1M",
+                    },
+                    "secret": "smoke-secret",
+                }
+            ]
+            assert expected_name in fake_client._dirs["/115/Anime/Frieren/Season 1"]
+            assert fake_client._dirs["/115/Anime/.oani-copy-tmp"] == {}
             assert (
                 expected_name not in fake_client._dirs["/PikPak/Anime/Frieren/Season 1"]
             )

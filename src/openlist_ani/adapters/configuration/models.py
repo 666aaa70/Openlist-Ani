@@ -50,6 +50,7 @@ AIProvider = Literal["openai-compatible", "anthropic-messages"]
 NotificationBotType = Literal["telegram", "pushplus", "wechat", "feishu"]
 FeishuConnectionMode = Literal["websocket", "webhook"]
 FeishuDomain = Literal["feishu", "lark"]
+CopyMode = Literal["copy", "aria2"]
 LogLevel = Literal[
     "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL", "FATAL"
 ]
@@ -212,11 +213,25 @@ class OpenListConfig(ConfigModel):
     download_path: str = Field(default="/", exclude=True)
     offline_download_tool: str = "qBittorrent"
     copy_target_paths: list[str] = Field(default_factory=list)
+    copy_mode: CopyMode = "copy"
+    copy_threads: int = Field(default=8, ge=1, le=16)
+    aria2_rpc_url: str = ""
+    aria2_rpc_secret: str = ""
     delete_source_after_copy: bool = True
     rename_format: str = Field(
         default="{anime_name} S{season:02d}E{episode:02d} {fansub} {quality} {languages}",
         exclude=True,
     )
+
+    @field_validator("copy_mode", mode="before")
+    @classmethod
+    def _normalize_copy_mode(cls, value: Any) -> Any:
+        return _normalize_choice(value)
+
+    @field_validator("aria2_rpc_url", mode="before")
+    @classmethod
+    def _normalize_aria2_rpc_url(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
 
     @field_validator("offline_download_tool", mode="before")
     @classmethod

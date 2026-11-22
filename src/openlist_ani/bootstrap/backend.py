@@ -158,12 +158,17 @@ def _log_startup_summary(config, core_settings: CoreSettings) -> None:
     logger.info(f"OpenList URL  : {config.downloader.openlist.url}")
     if config.downloader.openlist.copy_target_paths:
         targets = ", ".join(config.downloader.openlist.copy_target_paths)
-        mode = (
-            "copy+delete"
-            if config.downloader.openlist.delete_source_after_copy
+        transfer_mode = (
+            f"aria2/{config.downloader.openlist.copy_threads}t"
+            if config.downloader.openlist.copy_mode == "aria2"
             else "copy"
         )
-        logger.info(f"Copy targets  : {targets} ({mode})")
+        action = (
+            "delete source"
+            if config.downloader.openlist.delete_source_after_copy
+            else "keep source"
+        )
+        logger.info(f"Copy targets  : {targets} ({transfer_mode}, {action})")
     logger.info(f"Notifications : {notification_status}")
     logger.info(f"Backend API   : {config.backend.host}:{config.backend.port}")
     logger.info("=" * 56)
@@ -420,26 +425,37 @@ def _create_openlist_backend_bundle(
 ) -> DownloadBackendBundle:
     """Own the OpenList client and all lifecycle hooks inside one bundle."""
 
+    openlist_cfg = config.downloader.openlist
     client = client or OpenListClient(
-        base_url=config.downloader.openlist.url,
-        token=config.downloader.openlist.token,
+        base_url=openlist_cfg.url,
+        token=openlist_cfg.token,
+    )
+    extra_required_tools = (
+        ("aria2",)
+        if openlist_cfg.copy_target_paths and openlist_cfg.copy_mode == "aria2"
+        else ()
     )
     health = OpenListHealthCheck(
         client=client,
-        base_url=config.downloader.openlist.url,
-        offline_download_tool=config.downloader.openlist.offline_download_tool,
+        base_url=openlist_cfg.url,
+        offline_download_tool=openlist_cfg.offline_download_tool,
+        extra_required_tools=extra_required_tools,
     )
     close = getattr(client, "close", None)
     return DownloadBackendBundle(
         name="openlist",
         downloader=OpenListDownloadAdapter(
             client=client,
-            offline_download_tool=config.downloader.openlist.offline_download_tool,
+            offline_download_tool=openlist_cfg.offline_download_tool,
         ),
         organizer=OpenListOrganizerAdapter(
             client,
-            copy_target_paths=config.downloader.openlist.copy_target_paths,
-            delete_source_after_copy=config.downloader.openlist.delete_source_after_copy,
+            copy_target_paths=openlist_cfg.copy_target_paths,
+            copy_mode=openlist_cfg.copy_mode,
+            copy_threads=openlist_cfg.copy_threads,
+            aria2_rpc_url=openlist_cfg.aria2_rpc_url,
+            aria2_rpc_secret=openlist_cfg.aria2_rpc_secret,
+            delete_source_after_copy=openlist_cfg.delete_source_after_copy,
         ),
         health_check=health.validate,
         close=close if callable(close) else None,

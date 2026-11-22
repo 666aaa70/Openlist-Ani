@@ -36,6 +36,10 @@ url = "http://localhost:5244"
 token = ""
 offline_download_tool = "qBittorrent"  # Supported: aria2, qBittorrent, PikPak, 115 Cloud, 115 Open, 123Pan, 123 Open, SimpleHttp, Thunder, ThunderBrowser, ThunderX, Transmission
 copy_target_paths = []  # Optional: copy organized files to other OpenList folder(s), e.g. ["/115/Anime"]
+copy_mode = "copy"  # Copy transfer mode: "copy" (OpenList /api/fs/copy) or "aria2" (multi-threaded download via OpenList aria2)
+copy_threads = 8  # Multi-thread count for copy_mode = "aria2" (1-16, default: 8)
+# aria2_rpc_url = ""  # Optional: Aria2 JSON-RPC URL override (auto-discovered from OpenList settings when empty)
+# aria2_rpc_secret = ""  # Optional: Aria2 RPC secret override (auto-discovered from OpenList settings when empty)
 delete_source_after_copy = true  # Delete source files in download_path after all copy targets finish (only applies when copy_target_paths is non-empty)
 
 [metadata]
