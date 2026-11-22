@@ -20,6 +20,8 @@ from openlist_ani.adapters.configuration.models import (
     MetadataFilterConfig,
     NotificationConfig,
     OpenListConfig,
+    PriorityConfig,
+    RSSConfig,
     UserConfig,
 )
 
@@ -99,14 +101,68 @@ def test_corrupt_config_fails_closed(tmp_path):
 @pytest.mark.parametrize(
     "payload",
     [
+        {
+            "rss": {"urls": []},
+            "downloader": {
+                "download_path": "/PikPak/Anime",
+                "openlist": {
+                    "url": "http://localhost:5244",
+                    "token": "token",
+                    "offline_download_tool": "PikPak",
+                },
+            },
+        },
+        {
+            "downloader": {
+                "openlist": {
+                    "url": "http://localhost:5244",
+                    "token": "token",
+                }
+            }
+        },
+    ],
+    ids=["explicit-empty-rss-urls", "omitted-rss-section"],
+)
+def test_empty_rss_urls_config_is_ready_to_run(payload):
+    config = UserConfig.model_validate(payload)
+
+    assert config.rss.urls == []
+    assert ConfigValidator(config).validate() is True
+    settings = compile_core_settings(config)
+    validate_core_settings(settings)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
         {},
+        {"rss": {"urls": []}},
         {"rss": {"urls": ["https://example.test/feed.xml"]}},
         {
             "rss": {"urls": ["https://example.test/feed.xml"]},
             "downloader": {"openlist": {"url": "", "token": "token"}},
         },
+        {
+            "rss": {"urls": [""]},
+            "downloader": {
+                "openlist": {"url": "http://localhost:5244", "token": "token"}
+            },
+        },
+        {
+            "rss": {"urls": ["https://example.test/feed.xml", "   "]},
+            "downloader": {
+                "openlist": {"url": "http://localhost:5244", "token": "token"}
+            },
+        },
     ],
-    ids=["missing-rss", "missing-token", "missing-url"],
+    ids=[
+        "empty-config-missing-token",
+        "empty-rss-missing-token",
+        "missing-token",
+        "missing-url",
+        "blank-rss-url",
+        "mixed-blank-rss-url",
+    ],
 )
 def test_missing_required_runtime_settings_are_rejected(payload):
     assert ConfigValidator(UserConfig.model_validate(payload)).validate() is False
@@ -143,6 +199,11 @@ def test_enabled_optional_features_require_a_usable_configuration(overrides):
         lambda: NotificationConfig(batch_interval=-1),
         lambda: UserConfig.model_validate({"metdata": {"pipeline": ["regex"]}}),
         lambda: BotConfig(type="telegram", config={"bot_tokn": "typo"}),
+        lambda: RSSConfig(interval_time=0),
+        lambda: RSSConfig(interval_time=-10),
+        lambda: RSSConfig.model_validate({"urls": "https://example.test/feed.xml"}),
+        lambda: RSSConfig.model_validate({"unknown_key": True}),
+        lambda: PriorityConfig(field_order=["fansub", "fansub"]),
     ],
     ids=[
         "empty-tool",
@@ -151,6 +212,11 @@ def test_enabled_optional_features_require_a_usable_configuration(overrides):
         "negative-batch",
         "unknown-config-key",
         "unknown-notification-key",
+        "zero-rss-interval",
+        "negative-rss-interval",
+        "non-list-rss-urls",
+        "unknown-rss-key",
+        "duplicate-rss-priority-field",
     ],
 )
 def test_invalid_user_input_is_rejected_by_the_config_model(

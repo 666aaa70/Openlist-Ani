@@ -61,9 +61,7 @@ class ConfigValidator:
         return not errors
 
     def _validate_core_config(self, errors: list[str]) -> None:
-        if not self._data.rss.urls:
-            errors.append("No RSS URLs configured. Please add RSS URLs in [rss] urls.")
-        elif any(not url.strip() for url in self._data.rss.urls):
+        if any(not url.strip() for url in self._data.rss.urls):
             errors.append("RSS URLs cannot contain empty values.")
 
         openlist = self._data.downloader.openlist

@@ -61,20 +61,21 @@ class FeedScheduler:
                 if normalized_urls != self._synced_urls:
                     await self._feed_state.sync_urls(urls)
                     self._synced_urls = normalized_urls
-                due = await self._feed_state.list_due(self._batch_size)
-                if due:
-                    logger.info(f"RSS scan started: {len(due)} source(s)")
-                    results = await asyncio.gather(
-                        *(self._fetch_one(url) for url in due)
-                    )
-                    observed = sum(result.observed for result in results)
-                    queued = sum(result.queued for result in results)
-                    failed = sum(result.failed for result in results)
-                    logger.info(
-                        "RSS scan completed: "
-                        f"sources={len(due)}, observed={observed}, queued={queued}, "
-                        f"failed={failed}"
-                    )
+                if urls:
+                    due = await self._feed_state.list_due(self._batch_size)
+                    if due:
+                        logger.info(f"RSS scan started: {len(due)} source(s)")
+                        results = await asyncio.gather(
+                            *(self._fetch_one(url) for url in due)
+                        )
+                        observed = sum(result.observed for result in results)
+                        queued = sum(result.queued for result in results)
+                        failed = sum(result.failed for result in results)
+                        logger.info(
+                            "RSS scan completed: "
+                            f"sources={len(due)}, observed={observed}, queued={queued}, "
+                            f"failed={failed}"
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -121,6 +122,8 @@ class FeedScheduler:
 
     async def _wait_for_wake(self) -> None:
         self._wake.clear()
+        if self._stop.is_set():
+            return
         try:
             async with asyncio.timeout(5.0):
                 await self._wake.wait()
