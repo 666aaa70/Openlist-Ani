@@ -585,3 +585,115 @@ async def test_organizer_adapter_runs_organize_then_post_copy_and_survives_repla
     replayed = await adapter.organize(job, manifest, (request,), checkpoint)
     assert replayed == results
     assert len(client.copy_calls) == copy_count
+
+
+@pytest.mark.asyncio
+async def test_done_task_poll_failures_terminate_instead_of_looping_forever():
+    client = _InMemoryCopyClient(async_copy=True, polls_before_done=0)
+    client.put_file("/PikPak/Anime/Frieren/Season 1", "Frieren S01E01.mkv", size=2048)
+    client.put_file("/PikPak/Anime/Frieren/Season 1", "Frieren S01E01.zh.ass", size=128)
+    client._ensure_dir("/115/Anime/Frieren/Season 1")
+    client.get_copy_tasks_undone = AsyncMock(return_value=[])
+    client.get_copy_tasks_done = AsyncMock(return_value=None)
+
+    saved_state = {
+        "version": 1,
+        "items": {
+            "ep-1": {
+                "item_key": "ep-1",
+                "src_dir": "/PikPak/Anime/Frieren/Season 1",
+                "filenames": ["Frieren S01E01.mkv", "Frieren S01E01.zh.ass"],
+                "expected_sizes": {
+                    "Frieren S01E01.mkv": 2048,
+                    "Frieren S01E01.zh.ass": 128,
+                },
+                "targets": [
+                    {
+                        "target_root": "/115/Anime",
+                        "dst_dir": "/115/Anime/Frieren/Season 1",
+                        "state": "submitted",
+                        "task_ids": ["copy-1"],
+                    }
+                ],
+                "source_deleted": False,
+                "state": "pending",
+            }
+        },
+    }
+
+    executor = _make_executor(client, targets=["/115/Anime"], delete_source=True)
+    with pytest.raises(OrganizationError, match="done copy tasks"):
+        await executor.execute(_make_job(), (_make_result(),), saved_state=saved_state)
+
+    assert client.get_copy_tasks_done.await_count == executor._MAX_POLL_ERRORS
+    assert "Frieren S01E01.mkv" in client.dirs["/PikPak/Anime/Frieren/Season 1"]
+    assert client.remove_calls == []
+
+
+@pytest.mark.asyncio
+async def test_pending_retry_attaches_to_in_flight_copy_without_duplicating():
+    client = _InMemoryCopyClient(async_copy=True, polls_before_done=1)
+    client.put_file("/PikPak/Anime/Frieren/Season 1", "Frieren S01E01.mkv", size=2048)
+    client.put_file("/PikPak/Anime/Frieren/Season 1", "Frieren S01E01.zh.ass", size=128)
+    client._ensure_dir("/115/Anime/Frieren/Season 1")
+
+    # Simulate POST /api/fs/copy succeeding right before a crash prior to checkpoint save.
+    ok, _tasks = await client.copy_file(
+        "/PikPak/Anime/Frieren/Season 1",
+        "/115/Anime/Frieren/Season 1",
+        ["Frieren S01E01.mkv", "Frieren S01E01.zh.ass"],
+    )
+    assert ok is True
+    calls_before = len(client.copy_calls)
+
+    executor = _make_executor(client, targets=["/115/Anime"], delete_source=True)
+    results = await executor.execute(_make_job(), (_make_result(),))
+
+    assert len(client.copy_calls) == calls_before
+    assert results[0].final_path == "/115/Anime/Frieren/Season 1/Frieren S01E01.mkv"
+    assert client.dirs["/PikPak/Anime/Frieren/Season 1"] == {}
+
+
+@pytest.mark.asyncio
+async def test_nested_missing_target_root_creates_only_missing_subdirectories():
+    client = _InMemoryCopyClient(async_copy=False)
+    client.put_file("/PikPak/Anime/Frieren/Season 1", "Frieren S01E01.mkv", size=2048)
+    client.put_file("/PikPak/Anime/Frieren/Season 1", "Frieren S01E01.zh.ass", size=128)
+    client._ensure_dir("/115")
+    mkdir_calls: list[str] = []
+    original_mkdir = client.mkdir
+
+    async def tracking_mkdir(path: str) -> bool:
+        mkdir_calls.append(path)
+        return await original_mkdir(path)
+
+    client.mkdir = tracking_mkdir
+
+    executor = _make_executor(client, targets=["/115/Anime/2026"], delete_source=True)
+    results = await executor.execute(_make_job(), (_make_result(),))
+
+    assert "/115" not in mkdir_calls
+    assert mkdir_calls == [
+        "/115/Anime",
+        "/115/Anime/2026",
+        "/115/Anime/2026/Frieren",
+        "/115/Anime/2026/Frieren/Season 1",
+    ]
+    assert (
+        results[0].final_path == "/115/Anime/2026/Frieren/Season 1/Frieren S01E01.mkv"
+    )
+
+
+@pytest.mark.asyncio
+async def test_conflicting_directory_in_target_raises_and_keeps_source():
+    client = _InMemoryCopyClient(async_copy=False)
+    client.put_file("/PikPak/Anime/Frieren/Season 1", "Frieren S01E01.mkv", size=2048)
+    client.put_file("/PikPak/Anime/Frieren/Season 1", "Frieren S01E01.zh.ass", size=128)
+    client._ensure_dir("/115/Anime/Frieren/Season 1/Frieren S01E01.mkv")
+
+    executor = _make_executor(client, targets=["/115/Anime"], delete_source=True)
+    with pytest.raises(OrganizationError, match="directory with the same name"):
+        await executor.execute(_make_job(), (_make_result(),))
+
+    assert "Frieren S01E01.mkv" in client.dirs["/PikPak/Anime/Frieren/Season 1"]
+    assert client.remove_calls == []

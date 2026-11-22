@@ -17,6 +17,14 @@ _NOTIFICATION_REQUIREMENTS: dict[str, tuple[str, tuple[str, ...]]] = {
 }
 
 
+def _normalize_posix_path(path: str) -> str:
+    raw = (path or "/").strip().replace("\\", "/") or "/"
+    normalized = posixpath.normpath(raw)
+    if normalized.startswith("//"):
+        return "/" + normalized.lstrip("/")
+    return normalized
+
+
 def validate_core_settings(settings: CoreSettings) -> None:
     """Validate compiled core settings without external side effects."""
     positive_values = {
@@ -90,9 +98,8 @@ class ConfigValidator:
     ) -> None:
         if not target_paths:
             return
-        download_path = posixpath.normpath(
-            (self._data.downloader.download_path or "/").strip().replace("\\", "/")
-            or "/"
+        download_path = _normalize_posix_path(
+            self._data.downloader.download_path or "/"
         )
         for raw_path in target_paths:
             stripped = raw_path.strip()
@@ -112,7 +119,7 @@ class ConfigValidator:
                     f"segments: '{raw_path}'."
                 )
                 continue
-            if posixpath.normpath(normalized_raw) == download_path:
+            if _normalize_posix_path(normalized_raw) == download_path:
                 errors.append(
                     "OpenList copy_target_paths cannot equal downloader.download_path "
                     f"('{download_path}')."

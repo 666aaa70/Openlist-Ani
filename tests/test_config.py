@@ -194,6 +194,16 @@ def test_empty_rss_urls_config_is_ready_to_run(payload):
                 },
             }
         },
+        {
+            "downloader": {
+                "download_path": "/PikPak/Anime",
+                "openlist": {
+                    "url": "http://localhost:5244",
+                    "token": "token",
+                    "copy_target_paths": ["//PikPak/Anime"],
+                },
+            }
+        },
     ],
     ids=[
         "empty-config-missing-token",
@@ -206,6 +216,7 @@ def test_empty_rss_urls_config_is_ready_to_run(payload):
         "relative-copy-target-path",
         "traversal-copy-target-path",
         "copy-target-equals-download-path",
+        "copy-target-double-slash-equals-download-path",
     ],
 )
 def test_missing_required_runtime_settings_are_rejected(payload):

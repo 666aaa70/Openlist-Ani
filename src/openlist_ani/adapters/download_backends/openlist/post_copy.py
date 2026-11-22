@@ -34,7 +34,10 @@ def normalize_openlist_path(path: str) -> str:
         return "/"
     if not raw.startswith("/"):
         raw = f"/{raw}"
-    return posixpath.normpath(raw)
+    normalized = posixpath.normpath(raw)
+    if normalized.startswith("//"):
+        return "/" + normalized.lstrip("/")
+    return normalized
 
 
 def normalize_copy_target_paths(paths: Iterable[str]) -> tuple[str, ...]:
@@ -342,14 +345,16 @@ class OpenListPostCopyExecutor:
     ) -> None:
         await self._ensure_target_directory(target_root, dst_dir)
         dst_entries = await self._storage.list_directory(dst_dir)
-        existing = {
-            entry.name: entry for entry in dst_entries if not entry.is_directory
-        }
+        by_name = {entry.name: entry for entry in dst_entries}
 
         missing_names: list[str] = []
         needs_overwrite = False
         for name in filenames:
-            entry = existing.get(name)
+            entry = by_name.get(name)
+            if entry is not None and entry.is_directory:
+                raise OrganizationError(
+                    f"Cannot copy '{name}' to '{dst_dir}': a directory with the same name exists"
+                )
             expected = expected_sizes.get(name, 0)
             if entry is not None and (expected <= 0 or entry.size == expected):
                 continue
@@ -373,6 +378,22 @@ class OpenListPostCopyExecutor:
                 f"OpenList copy already up to date in {dst_dir} "
                 f"({len(filenames)} file(s))"
             )
+            return
+
+        # If a previous attempt crashed between POST /api/fs/copy and checkpoint
+        # persistence, attach to the already-running OpenList task instead of
+        # starting a duplicate copy.
+        existing_undone_ids = await self._find_matching_undone_task_ids(
+            src_dir, dst_dir, missing_names
+        )
+        if existing_undone_ids:
+            logger.info(
+                f"Resuming existing OpenList copy task(s) for {dst_dir}: "
+                f"{existing_undone_ids}"
+            )
+            target_state["task_ids"] = existing_undone_ids
+            target_state["state"] = "submitted"
+            await persist()
             return
 
         logger.info(
@@ -400,9 +421,12 @@ class OpenListPostCopyExecutor:
         await persist()
 
     async def _ensure_target_directory(self, target_root: str, dst_dir: str) -> None:
-        if target_root != "/" and await self._client.list_files(target_root) is None:
-            await self._storage.ensure_directory("/", target_root)
-        await self._storage.ensure_directory(target_root, dst_dir)
+        ancestor = normalize_openlist_path(target_root)
+        while ancestor != "/":
+            if await self._client.list_files(ancestor) is not None:
+                break
+            ancestor = normalize_openlist_path(posixpath.dirname(ancestor))
+        await self._storage.ensure_directory(ancestor, dst_dir)
 
     async def _find_matching_undone_task_ids(
         self,
@@ -438,6 +462,7 @@ class OpenListPostCopyExecutor:
     ) -> None:
         remaining = set(task_ids)
         consecutive_poll_errors = 0
+        logged_milestones: dict[str, int] = {}
         while remaining:
             undone = await self._client.get_copy_tasks_undone()
             if undone is None:
@@ -448,10 +473,11 @@ class OpenListPostCopyExecutor:
                     )
                 await self._sleep(self._poll_interval_seconds)
                 continue
-            consecutive_poll_errors = 0
 
             undone_by_id = {task.id: task for task in undone if task.id}
             still_running = [tid for tid in remaining if tid in undone_by_id]
+            for tid in still_running:
+                self._log_copy_progress(undone_by_id[tid], dst_dir, logged_milestones)
             settled_candidates = remaining - set(still_running)
 
             if settled_candidates:
@@ -464,7 +490,9 @@ class OpenListPostCopyExecutor:
                         )
                     await self._sleep(self._poll_interval_seconds)
                     continue
+                consecutive_poll_errors = 0
                 done_by_id = {task.id: task for task in done if task.id}
+                settled_any = False
                 for tid in list(settled_candidates):
                     finished = done_by_id.get(tid)
                     if finished is None:
@@ -475,15 +503,12 @@ class OpenListPostCopyExecutor:
                             f"verifying target directory {dst_dir}"
                         )
                         remaining.discard(tid)
+                        settled_any = True
                         continue
-                    self._check_finished_copy_task(
-                        finished=finished,
-                        src_dir=src_dir,
-                        dst_dir=dst_dir,
-                        target_state=target_state,
-                    )
+                    self._log_terminal_copy_failure(finished, src_dir, dst_dir)
                     if finished.state == OpenlistTaskState.SUCCEEDED:
                         remaining.discard(tid)
+                        settled_any = True
                     else:
                         target_state["state"] = "pending"
                         target_state["task_ids"] = []
@@ -493,17 +518,38 @@ class OpenListPostCopyExecutor:
                             f"OpenList copy task {tid} failed ({src_dir} -> {dst_dir}): "
                             f"{details}"
                         )
+                if settled_any and remaining:
+                    target_state["task_ids"] = sorted(remaining)
+                    await persist()
+            else:
+                consecutive_poll_errors = 0
 
             if remaining:
                 await self._sleep(self._poll_interval_seconds)
 
     @staticmethod
-    def _check_finished_copy_task(
-        *,
+    def _log_copy_progress(
+        task: OpenlistTask, dst_dir: str, logged_milestones: dict[str, int]
+    ) -> None:
+        if task.progress is None:
+            return
+        try:
+            progress = float(task.progress)
+        except (TypeError, ValueError):
+            return
+        milestone = int(progress // 25) * 25
+        if milestone >= 25 and milestone > logged_milestones.get(task.id, 0):
+            logged_milestones[task.id] = milestone
+            logger.info(
+                f"OpenList copy in progress ({progress:.0f}%): "
+                f"task={task.id}, dst={dst_dir}"
+            )
+
+    @staticmethod
+    def _log_terminal_copy_failure(
         finished: OpenlistTask,
         src_dir: str,
         dst_dir: str,
-        target_state: dict[str, Any],
     ) -> None:
         if finished.state in _TERMINAL_FAILURE_STATES:
             logger.warning(
